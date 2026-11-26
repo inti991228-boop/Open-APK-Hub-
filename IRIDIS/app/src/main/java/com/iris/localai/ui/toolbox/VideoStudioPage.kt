@@ -138,7 +138,7 @@ fun VideoStudioPage() {
     SettingsGroup {
         Column(
             Modifier.fillMaxWidth().padding(IrisDimens.space16),
-            verticalArrangement = Arrangement.spacedBy(IrisDimens.space10),
+            verticalArrangement = Arrangement.spacedBy(IrisDimens.space8),
         ) {
             VideoStepHeading("1", "載入影片模型")
             VideoModelStatusBadge(selected != null)
@@ -214,7 +214,7 @@ fun VideoStudioPage() {
     SettingsGroup {
         Column(
             Modifier.fillMaxWidth().padding(IrisDimens.space16),
-            verticalArrangement = Arrangement.spacedBy(IrisDimens.space10),
+            verticalArrangement = Arrangement.spacedBy(IrisDimens.space8),
         ) {
             VideoStepHeading("2", "選擇首幀與動態")
             Text("先選一張圖片作為影片開場畫面。", style = IrisType.caption, color = Iris.colors.textSecondary)
@@ -280,7 +280,7 @@ fun VideoStudioPage() {
     SettingsGroup {
         Column(
             Modifier.fillMaxWidth().padding(IrisDimens.space16),
-            verticalArrangement = Arrangement.spacedBy(IrisDimens.space10),
+            verticalArrangement = Arrangement.spacedBy(IrisDimens.space8),
         ) {
             VideoStepHeading("3", "生成與觀看影片")
             Text(
@@ -367,7 +367,7 @@ private fun OnnxBundle.supportsVideoGeneration(): Boolean {
 
 @Composable
 private fun VideoStepHeading(number: String, title: String) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(IrisDimens.space10)) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
         Box(
             Modifier.size(32.dp).background(Iris.colors.accentContainer, IrisRadius.mediumShape),
             contentAlignment = Alignment.Center,
@@ -387,7 +387,7 @@ private fun VideoModelStatusBadge(ready: Boolean) {
         color = color,
         modifier = Modifier.fillMaxWidth()
             .background(color.copy(alpha = 0.12f), IrisRadius.mediumShape)
-            .padding(horizontal = IrisDimens.space12, vertical = IrisDimens.space10),
+            .padding(horizontal = IrisDimens.space12, vertical = IrisDimens.space8),
     )
 }
 

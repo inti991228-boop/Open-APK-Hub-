@@ -231,7 +231,7 @@ private fun MusicGenSection() {
 
     SectionTitle("音樂創作工作室")
     SettingsGroup {
-        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16), verticalArrangement = Arrangement.spacedBy(IrisDimens.space10)) {
+        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16), verticalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
             StepHeading("1", "先載入音樂模型")
             ModelStatusBadge(
                 ready = selected != null,
@@ -306,7 +306,7 @@ private fun MusicGenSection() {
     }
 
     SettingsGroup {
-        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16), verticalArrangement = Arrangement.spacedBy(IrisDimens.space10)) {
+        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16), verticalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
             StepHeading("2", "寫下你想聽的音樂")
             Text("描述心情、樂器或場景，模型會在你的裝置上創作。", style = IrisType.caption, color = Iris.colors.textSecondary)
             OutlinedTextField(
@@ -399,7 +399,7 @@ private fun MusicGenSection() {
     }
 
     SettingsGroup {
-        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16), verticalArrangement = Arrangement.spacedBy(IrisDimens.space10)) {
+        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16), verticalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
             StepHeading("3", "試聽與匯出作品")
             Text(
                 when {
@@ -511,7 +511,7 @@ private fun OnnxBundle.supportsMusicGeneration(): Boolean {
 
 @Composable
 private fun StepHeading(number: String, title: String) {
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(IrisDimens.space10)) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
         Box(
             Modifier.size(32.dp).background(Iris.colors.accentContainer, IrisRadius.mediumShape),
             contentAlignment = Alignment.Center,
@@ -531,7 +531,7 @@ private fun ModelStatusBadge(ready: Boolean, readyText: String, missingText: Str
         color = color,
         modifier = Modifier.fillMaxWidth()
             .background(color.copy(alpha = 0.12f), IrisRadius.mediumShape)
-            .padding(horizontal = IrisDimens.space12, vertical = IrisDimens.space10),
+            .padding(horizontal = IrisDimens.space12, vertical = IrisDimens.space8),
     )
 }
 
