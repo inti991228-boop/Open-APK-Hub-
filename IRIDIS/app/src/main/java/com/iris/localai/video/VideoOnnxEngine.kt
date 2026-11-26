@@ -37,11 +37,13 @@ object VideoOnnxEngine {
         bundle: OnnxBundle,
         firstFrame: Bitmap,
         output: File,
+        motionBucketId: Int = 127,
         seed: Int? = null,
         onProgress: (Int) -> Unit = {},
         isCancelled: () -> Boolean = { Thread.currentThread().isInterrupted },
     ): File {
         require(firstFrame.width > 0 && firstFrame.height > 0) { "Selected image is empty" }
+        require(motionBucketId in 0..255) { "Motion bucket must be between 0 and 255" }
         val imageEncoderFile = OnnxBundleLibrary.resolve(filesDir, bundle, "image_encoder.onnx")
         val vaeEncoderFile = OnnxBundleLibrary.resolve(filesDir, bundle, "vae_encoder.onnx")
         val unetFile = OnnxBundleLibrary.resolve(filesDir, bundle, "unet.onnx")
@@ -79,7 +81,7 @@ object VideoOnnxEngine {
                             require(imageLatent.size == LATENT_CHANNELS * expectedSpatialSize) {
                                 "VAE encoder output has an unsupported batch shape"
                             }
-                            val timeIds = floatArrayOf((FPS - 1).toFloat(), 127f, 0f)
+                            val timeIds = floatArrayOf((FPS - 1).toFloat(), motionBucketId.toFloat(), 0f)
                             val totalLatents = FRAME_COUNT * LATENT_CHANNELS * expectedSpatialSize
                             var latents = FloatArray(totalLatents) { random.nextGaussian().toFloat() * scheduler.initialSigma }
                             val condition = FloatArray(totalLatents)

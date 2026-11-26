@@ -11,10 +11,12 @@ import androidx.compose.ui.draw.clip
 
 import androidx.compose.foundation.horizontalScroll
 
+import android.content.ClipData
 import android.content.Intent
 import android.media.MediaPlayer
 import android.net.Uri
-import android.provider.OpenableColumns
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -31,6 +33,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Icon
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -63,9 +67,6 @@ import com.iris.localai.I18n
 import com.iris.localai.R
 import com.iris.localai.floating.FloatingService
 import com.iris.localai.musicgen.MusicGenOnnxEngine
-import com.iris.localai.musicgen.ImportedMusicModel
-import com.iris.localai.musicgen.MusicModelLibrary
-import com.iris.localai.musicgen.MusicModelSource
 import com.iris.localai.onnx.OnnxBundle
 import com.iris.localai.onnx.OnnxBundleLibrary
 import com.iris.localai.ui.chat.ChatViewModel
@@ -105,7 +106,7 @@ fun ToolboxPage(chat: ChatViewModel, onBack: () -> Unit, onOpenImageGen: () -> U
     androidx.activity.compose.BackHandler(open != null) { open = null }
     val floating by FloatingService.running.collectAsStateWithLifecycle()
     when (open) {
-        "music" -> SubpageScaffold("MusicGen", { open = null }) { ScrollBody { MusicGenSection() } }
+        "music" -> SubpageScaffold("音樂生成", { open = null }) { ScrollBody { MusicGenSection() } }
         "video" -> SubpageScaffold("影片生成", { open = null }) { ScrollBody { VideoStudioPage() } }
         "tts" -> SubpageScaffold(I18n.s(R.string.v30_tb_tts), { open = null }) { ScrollBody { TtsSection(chat) } }
         "stt" -> SubpageScaffold(I18n.s(R.string.v30_tb_stt), { open = null }) { ScrollBody { SttSection(chat) } }
@@ -114,8 +115,8 @@ fun ToolboxPage(chat: ChatViewModel, onBack: () -> Unit, onOpenImageGen: () -> U
         else -> {
             val tools = listOf(
                 Tool("image", IrisIcons.Image, I18n.s(R.string.v30_w_image), I18n.s(R.string.v30_tb_image_sub)),
-                Tool("music", IrisIcons.Sound, "MusicGen", I18n.s(R.string.v2_mg_tool_sub)),
-                Tool("video", IrisIcons.Image, "影片生成", "匯入 SVD-XT ONNX 模型並從圖片生成影片"),
+                Tool("music", IrisIcons.MusicNote, "音樂生成", "輸入描述詞，離線創作專屬音樂"),
+                Tool("video", IrisIcons.Movie, "影片生成", "選張圖片，讓畫面動起來"),
                 Tool("float", IrisIcons.Layers, I18n.s(R.string.v30_floating), if (floating) I18n.s(R.string.v30_tb_on) else I18n.s(R.string.v30_tb_float_sub2)),
                 Tool("tts", IrisIcons.Sound, I18n.s(R.string.v30_tb_tts), I18n.s(R.string.v30_tb_tts_sub)),
                 Tool("stt", IrisIcons.Chat, I18n.s(R.string.v30_tb_stt), I18n.s(R.string.v30_tb_stt_sub)),
@@ -147,26 +148,25 @@ private fun MusicGenSection() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var bundles by remember { mutableStateOf<List<OnnxBundle>>(emptyList()) }
-    var legacyModels by remember { mutableStateOf<List<ImportedMusicModel>>(emptyList()) }
     var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
+    var requiredFilesExpanded by rememberSaveable { mutableStateOf(false) }
     var prompt by rememberSaveable { mutableStateOf("") }
     var duration by rememberSaveable { mutableFloatStateOf(5f) }
+    var progress by androidx.compose.runtime.mutableIntStateOf(0)
     var output by remember { mutableStateOf<File?>(null) }
     var player by remember { mutableStateOf<MediaPlayer?>(null) }
     var playerReady by remember { mutableStateOf(false) }
     var playing by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+    val clipboard = LocalClipboardManager.current
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
 
     suspend fun reload() {
         val loaded = withContext(Dispatchers.IO) { OnnxBundleLibrary.list(context.filesDir) }
         bundles = loaded
-        legacyModels = withContext(Dispatchers.IO) { MusicModelLibrary.list(context.filesDir) }
-        val supported = loaded.filter { bundle ->
-            val names = bundle.assets.map { it.path.substringAfterLast('/') }.toSet()
-            setOf("config.json", "tokenizer.json", "text_encoder.onnx", "decoder_model_merged.onnx", "encodec_decode.onnx")
-                .all { it in names }
-        }
+        val supported = loaded.filter { it.supportsMusicGeneration() }
         if (selectedId !in supported.map { it.id }) selectedId = supported.firstOrNull()?.id
     }
 
@@ -191,9 +191,15 @@ private fun MusicGenSection() {
         if (uri != null) scope.launch {
             busy = true
             error = null
+            statusMessage = null
             try {
-                withContext(Dispatchers.IO) { OnnxBundleLibrary.importTree(context, uri) }
+                val imported = withContext(Dispatchers.IO) { OnnxBundleLibrary.importTree(context, uri) }
                 reload()
+                if (imported.supportsMusicGeneration()) {
+                    selectedId = imported.id
+                } else {
+                    error = "這個資料夾還不能用來創作音樂，請查看上方所需檔案清單。"
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -203,200 +209,218 @@ private fun MusicGenSection() {
             }
         }
     }
-    val legacyPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        if (uris.isNotEmpty()) scope.launch {
-            busy = true
-            error = null
+    val savePicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("audio/wav")) { uri ->
+        val wav = output
+        if (uri != null && wav != null) scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    val resolver = context.contentResolver
-                    val sources = uris.distinct().map { uri ->
-                        val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                            if (cursor.moveToFirst()) cursor.getString(0) else null
-                        } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "model.gguf"
-                        MusicModelSource(name) {
-                            resolver.openInputStream(uri) ?: throw IOException("Unable to read selected file: $name")
-                        }
-                    }
-                    MusicModelLibrary.import(context.filesDir, sources)
+                    val destination = context.contentResolver.openOutputStream(uri)
+                        ?: throw IOException("無法建立 WAV 檔案")
+                    wav.inputStream().use { input -> destination.use { output -> input.copyTo(output) } }
                 }
-                reload()
+                statusMessage = "已儲存到你選擇的位置"
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 error = e.localizedMessage ?: e.javaClass.simpleName
-            } finally {
-                busy = false
-                            }
+            }
         }
     }
-
-    val musicBundles = bundles.filter { bundle ->
-        val names = bundle.assets.map { it.path.substringAfterLast('/') }.toSet()
-        setOf("config.json", "tokenizer.json", "text_encoder.onnx", "decoder_model_merged.onnx", "encodec_decode.onnx")
-            .all { it in names }
-    }
+    val musicBundles = bundles.filter { it.supportsMusicGeneration() }
     val selected = musicBundles.firstOrNull { it.id == selectedId }
-    SectionTitle("MusicGen ONNX")
+
+    SectionTitle("音樂創作工作室")
     SettingsGroup {
-        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
-            Text(
-                "選取包含 config.json、tokenizer.json、text_encoder.onnx、decoder_model_merged.onnx 與 encodec_decode.onnx 的模型資料夾。",
-                style = IrisType.secondary,
-                color = Iris.colors.textSecondary,
+        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16), verticalArrangement = Arrangement.spacedBy(IrisDimens.space10)) {
+            StepHeading("1", "先載入音樂模型")
+            ModelStatusBadge(
+                ready = selected != null,
+                readyText = "✅ 模型已就緒",
+                missingText = "⚠️ 尚未載入音樂模型",
             )
-            Spacer(Modifier.height(IrisDimens.space8))
-            Text("模型只複製到本機 App 儲存空間，不會打包進 APK。", style = IrisType.caption, color = Iris.colors.textTertiary)
-            Spacer(Modifier.height(IrisDimens.space12))
+            selected?.let { Text("目前使用：${it.name}", style = IrisType.secondary, color = Iris.colors.textSecondary) }
             IrisButton(
-                "匯入 ONNX 模型資料夾",
+                "選擇模型資料夾",
                 onClick = { picker.launch(null) },
                 enabled = !busy,
+                modifier = Modifier.fillMaxWidth(),
+                style = IrisButtonStyle.Primary,
+                icon = IrisIcons.Folder,
+            )
+            if (musicBundles.isNotEmpty()) {
+                Text("已匯入的模型", style = IrisType.caption, color = Iris.colors.textSecondary)
+                musicBundles.forEach { bundle ->
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
+                        IrisButton(
+                            bundle.name,
+                            onClick = { selectedId = bundle.id },
+                            modifier = Modifier.weight(1f),
+                            compact = true,
+                            style = if (selectedId == bundle.id) IrisButtonStyle.Tonal else IrisButtonStyle.Outline,
+                            icon = if (selectedId == bundle.id) IrisIcons.Check else null,
+                        )
+                        IrisButton(
+                            "移除",
+                            onClick = {
+                                scope.launch {
+                                    try {
+                                        withContext(Dispatchers.IO) { OnnxBundleLibrary.delete(context.filesDir, bundle.id) }
+                                        reload()
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        error = e.localizedMessage ?: e.javaClass.simpleName
+                                    }
+                                }
+                            },
+                            compact = true,
+                            style = IrisButtonStyle.Text,
+                            destructive = true,
+                        )
+                    }
+                }
+            }
+            IrisButton(
+                if (requiredFilesExpanded) "隱藏所需檔案清單" else "查看所需檔案清單（點此展開）",
+                onClick = { requiredFilesExpanded = !requiredFilesExpanded },
+                compact = true,
+                style = IrisButtonStyle.Text,
+                icon = IrisIcons.ChevronRight,
+            )
+            Fold(requiredFilesExpanded) {
+                Column(verticalArrangement = Arrangement.spacedBy(IrisDimens.space6)) {
+                    MUSIC_REQUIRED_FILES.forEach { Text("• $it", style = IrisType.caption, color = Iris.colors.textSecondary) }
+                }
+            }
+            IrisButton(
+                "複製推薦模型名稱（Xenova/musicgen-small）",
+                onClick = {
+                    clipboard.setText(AnnotatedString(RECOMMENDED_MUSIC_MODEL))
+                    statusMessage = "已複製模型名稱，可貼上搜尋"
+                },
                 compact = true,
                 style = IrisButtonStyle.Tonal,
-                icon = IrisIcons.File,
+                icon = IrisIcons.Copy,
             )
         }
     }
 
-    if (busy) Text("正在準備模型或生成音訊…", style = IrisType.caption, color = Iris.colors.textSecondary)
-    if (musicBundles.isEmpty() && !busy) Text(
-        "尚未匯入完整的 MusicGen ONNX 模型資料夾。",
-        style = IrisType.secondary,
-        color = Iris.colors.textTertiary,
-        modifier = Modifier.padding(horizontal = IrisDimens.rowPadding, vertical = IrisDimens.space12),
-    )
-    SectionTitle("既有 GGUF／Safetensors／MNN 素材")
     SettingsGroup {
-        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
-            Text("此區僅保留素材管理；MusicGen 推論需使用上方相容的 ONNX bundle。", style = IrisType.caption, color = Iris.colors.textTertiary)
-            IrisButton(
-                "匯入既有模型檔",
-                onClick = { legacyPicker.launch(arrayOf("*/*")) },
-                enabled = !busy,
-                compact = true,
-                style = IrisButtonStyle.Tonal,
+        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16), verticalArrangement = Arrangement.spacedBy(IrisDimens.space10)) {
+            StepHeading("2", "寫下你想聽的音樂")
+            Text("描述心情、樂器或場景，模型會在你的裝置上創作。", style = IrisType.caption, color = Iris.colors.textSecondary)
+            OutlinedTextField(
+                value = prompt,
+                onValueChange = { prompt = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("你想聽到什麼？") },
+                placeholder = { Text("例如：雨天窗邊的柔和鋼琴與弦樂") },
+                minLines = 3,
+                maxLines = 5,
+                colors = irisTextFieldColors(),
+                textStyle = IrisType.body.copy(color = Iris.colors.text),
             )
-        }
-    }
-    legacyModels.forEach { model ->
-        SettingsGroup {
-            Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
-                Text(model.name, style = IrisType.label, color = Iris.colors.text)
-                Text("${model.assets.size} 個素材檔案", style = IrisType.caption, color = Iris.colors.textSecondary)
-                IrisButton(
-                    "刪除素材",
-                    onClick = {
-                        scope.launch {
-                            try {
-                                withContext(Dispatchers.IO) { MusicModelLibrary.delete(context.filesDir, model.id) }
-                                reload()
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (e: Exception) {
-                                error = e.localizedMessage ?: e.javaClass.simpleName
-                            }
-                        }
-                    },
-                    compact = true,
-                    style = IrisButtonStyle.Text,
-                    destructive = true,
+            Text("一鍵加入靈感", style = IrisType.caption, color = Iris.colors.textSecondary)
+            Row(horizontalArrangement = Arrangement.spacedBy(IrisDimens.space6)) {
+                AssistChip(
+                    onClick = { prompt = "療癒鋼琴曲，溫柔、舒緩，適合放鬆" },
+                    label = { Text("療癒鋼琴曲") },
                 )
+                AssistChip(
+                    onClick = { prompt = "賽博龐克電音，霓虹城市感，節奏鮮明" },
+                    label = { Text("賽博龐克電音") },
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(IrisDimens.space6)) {
+                AssistChip(
+                    onClick = { prompt = "Lo-Fi 讀書節拍，溫暖黑膠質感，安靜專注" },
+                    label = { Text("Lo-Fi 讀書節拍") },
+                )
+                AssistChip(
+                    onClick = { prompt = "史詩電影配樂，宏大弦樂與銅管，充滿希望" },
+                    label = { Text("史詩電影配樂") },
+                )
+            }
+            SliderRow("音樂長度", duration, 5f..20f, "${duration.toInt()} 秒", subtitle = "目前最長可生成 20 秒", steps = 14) {
+                duration = it
+            }
+            IrisButton(
+                when {
+                    busy -> "正在創作音樂…"
+                    selected == null -> "請先選擇模型資料夾"
+                    prompt.isBlank() -> "請輸入音樂描述"
+                    else -> "開始創作音樂"
+                },
+                onClick = {
+                    val bundle = selected
+                    if (bundle != null && prompt.isNotBlank()) scope.launch {
+                        busy = true
+                        progress = 0
+                        error = null
+                        statusMessage = null
+                        output = null
+                        player?.release()
+                        player = null
+                        playerReady = false
+                        playing = false
+                        try {
+                            val text = prompt.trim()
+                            val seconds = duration.toInt()
+                            val wav = withContext(Dispatchers.IO) {
+                                val file = File(context.filesDir, "musicgen/${UUID.randomUUID()}.wav")
+                                MusicGenOnnxEngine.generate(
+                                    context.filesDir,
+                                    bundle,
+                                    text,
+                                    file,
+                                    durationSeconds = seconds,
+                                    onProgress = { value -> mainHandler.post { progress = value } },
+                                ).wav
+                            }
+                            output = wav
+                            progress = 100
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            error = e.localizedMessage ?: e.javaClass.simpleName
+                        } finally {
+                            busy = false
+                        }
+                    }
+                },
+                enabled = !busy && selected != null && prompt.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+                icon = IrisIcons.MusicNote,
+            )
+            if (selected == null) {
+                Text("請先完成上方第 1 步：選擇模型資料夾。", style = IrisType.caption, color = Iris.colors.textTertiary)
             }
         }
     }
-    musicBundles.forEach { bundle ->
-        SettingsGroup(Modifier.clickable { selectedId = bundle.id }) {
-            Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
-                Text(bundle.name, style = IrisType.label, color = Iris.colors.text)
-                Text("${bundle.assets.size} 個模型檔案", style = IrisType.caption, color = Iris.colors.textSecondary)
-                Text(
-                    bundle.assets.map { it.path.substringAfterLast('/') }.take(5).joinToString("、"),
-                    style = IrisType.caption,
-                    color = Iris.colors.textTertiary,
-                    maxLines = 2,
-                )
-                if (selectedId == bundle.id) Text("已選取", style = IrisType.caption, color = Iris.colors.accent)
-                IrisButton(
-                    "刪除模型",
-                    onClick = {
-                        scope.launch {
-                            try {
-                                withContext(Dispatchers.IO) { OnnxBundleLibrary.delete(context.filesDir, bundle.id) }
-                                reload()
-                                error = null
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (e: Exception) {
-                                error = e.localizedMessage ?: e.javaClass.simpleName
-                            }
-                        }
-                    },
-                    compact = true,
-                    style = IrisButtonStyle.Text,
-                    destructive = true,
-                )
-            }
-        }
-    }
-    selected?.let { bundle ->
-        SectionTitle("文字生成音樂")
-        SettingsGroup {
-            Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
-                OutlinedTextField(
-                    value = prompt,
-                    onValueChange = { prompt = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("音樂描述") },
-                    placeholder = { Text("例如：柔和鋼琴與弦樂，平靜電影配樂") },
-                    minLines = 2,
-                    maxLines = 4,
-                    colors = irisTextFieldColors(),
-                    textStyle = IrisType.body.copy(color = Iris.colors.text),
-                )
-                Spacer(Modifier.height(IrisDimens.space8))
-                SliderRow("長度", duration, 1f..20f, "${duration.toInt()} 秒", steps = 18) { duration = it }
-                IrisButton(
-                    if (busy) "正在生成…" else "生成 WAV",
-                    onClick = {
-                        scope.launch {
-                            busy = true
-                            error = null
-                            try {
-                                player?.release()
-                                player = null
-                                playerReady = false
-                                playing = false
-                                output = withContext(Dispatchers.IO) {
-                                    val file = File(context.filesDir, "musicgen/${UUID.randomUUID()}.wav")
-                                    MusicGenOnnxEngine.generate(context.filesDir, bundle, prompt, file, duration.toInt()).wav
-                                }
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (e: Exception) {
-                                error = e.localizedMessage ?: e.javaClass.simpleName
-                            } finally {
-                                busy = false
-                            }
-                        }
-                    },
-                    enabled = !busy && prompt.isNotBlank(),
-                    compact = true,
-                    style = IrisButtonStyle.Primary,
-                    icon = IrisIcons.Sound,
-                )
-            }
-        }
-    }
-    output?.let { wav ->
-        SettingsGroup {
-            Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
-                Text("生成檔案：${wav.name}", style = IrisType.label, color = Iris.colors.text)
+
+    SettingsGroup {
+        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16), verticalArrangement = Arrangement.spacedBy(IrisDimens.space10)) {
+            StepHeading("3", "試聽與匯出作品")
+            Text(
+                when {
+                    busy -> "正在為你創作… $progress%"
+                    output != null -> "創作完成 · 100%"
+                    else -> "完成後，作品會出現在這裡"
+                },
+                style = IrisType.secondary,
+                color = if (output != null) Iris.colors.success else Iris.colors.textSecondary,
+            )
+            LinearProgressIndicator(
+                progress = { if (output != null) 1f else (progress / 100f).coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            output?.let { wav ->
+                Text(wav.name, style = IrisType.caption, color = Iris.colors.textTertiary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 IrisButton(
                     when {
                         playing -> "暫停試聽"
-                        player != null && !playerReady -> "載入音訊…"
-                        else -> "播放 WAV"
+                        player != null && !playerReady -> "正在載入音樂…"
+                        else -> "播放作品"
                     },
                     onClick = {
                         try {
@@ -417,7 +441,7 @@ private fun MusicGenSection() {
                                     if (player === failed) player = null
                                     playerReady = false
                                     playing = false
-                                    error = "WAV 播放失敗（$what/$extra）"
+                                    error = "音樂播放失敗（$what/$extra）"
                                     true
                                 }
                                 next.setOnCompletionListener { playing = false }
@@ -434,16 +458,92 @@ private fun MusicGenSection() {
                             error = e.localizedMessage ?: e.javaClass.simpleName
                         }
                     },
-                    enabled = player == null || playerReady || playing,
-                    compact = true,
+                    enabled = !busy && (player == null || playerReady || playing),
+                    modifier = Modifier.fillMaxWidth(),
                     style = IrisButtonStyle.Tonal,
                     icon = IrisIcons.Sound,
                 )
+                Row(horizontalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
+                    IrisButton(
+                        "分享 WAV",
+                        onClick = {
+                            try {
+                                shareWav(context, wav)
+                            } catch (e: Exception) {
+                                error = e.localizedMessage ?: e.javaClass.simpleName
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        compact = true,
+                        style = IrisButtonStyle.Outline,
+                        icon = IrisIcons.Share,
+                    )
+                    IrisButton(
+                        "儲存 WAV",
+                        onClick = { savePicker.launch(wav.name) },
+                        modifier = Modifier.weight(1f),
+                        compact = true,
+                        style = IrisButtonStyle.Outline,
+                        icon = IrisIcons.Download,
+                    )
+                }
             }
         }
     }
-    error?.let { Text("錯誤：$it", style = IrisType.caption, color = Iris.colors.warning) }
+    statusMessage?.let { Text(it, style = IrisType.caption, color = Iris.colors.success) }
+    error?.let { Text("發生問題：$it", style = IrisType.caption, color = Iris.colors.warning) }
     Spacer(Modifier.height(IrisDimens.space12))
+}
+
+private val MUSIC_REQUIRED_FILES = listOf(
+    "config.json",
+    "tokenizer.json",
+    "text_encoder.onnx",
+    "decoder_model_merged.onnx",
+    "encodec_decode.onnx",
+)
+private const val RECOMMENDED_MUSIC_MODEL = "Xenova/musicgen-small"
+
+private fun OnnxBundle.supportsMusicGeneration(): Boolean {
+    val names = assets.map { it.path.substringAfterLast('/') }.toSet()
+    return names.containsAll(MUSIC_REQUIRED_FILES)
+}
+
+@Composable
+private fun StepHeading(number: String, title: String) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(IrisDimens.space10)) {
+        Box(
+            Modifier.size(32.dp).background(Iris.colors.accentContainer, IrisRadius.mediumShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(number, style = IrisType.label, color = Iris.colors.onAccentContainer)
+        }
+        Text(title, style = IrisType.label, color = Iris.colors.text)
+    }
+}
+
+@Composable
+private fun ModelStatusBadge(ready: Boolean, readyText: String, missingText: String) {
+    val color = if (ready) Iris.colors.success else Iris.colors.warning
+    Text(
+        if (ready) readyText else missingText,
+        style = IrisType.label,
+        color = color,
+        modifier = Modifier.fillMaxWidth()
+            .background(color.copy(alpha = 0.12f), IrisRadius.mediumShape)
+            .padding(horizontal = IrisDimens.space12, vertical = IrisDimens.space10),
+    )
+}
+
+private fun shareWav(context: android.content.Context, wav: File) {
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", wav)
+    val share = Intent(Intent.ACTION_SEND).apply {
+        type = "audio/wav"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        clipData = ClipData.newUri(context.contentResolver, wav.name, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(share, "分享音樂"))
 }
 
 /** Beta3：悬浮窗设置页（工具箱里点进来，不再一点就开）。 */

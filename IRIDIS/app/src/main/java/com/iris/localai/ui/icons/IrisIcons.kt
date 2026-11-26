@@ -122,6 +122,11 @@ object IrisIcons {
     /** 音效 (2.0.x) */
     val Sound: ImageVector by lazy { icon("Sound", "M4 9.5h3l4.5-4v13L7 14.5H4z M15 9a4 4 0 0 1 0 6 M17.5 6.5a7.5 7.5 0 0 1 0 11") }
 
+    /** 音樂創作 */
+    val MusicNote: ImageVector by lazy {
+        icon("MusicNote", "M9 18V5l12-2v13 M9 18a3 3 0 1 1-3-3c1.7 0 3 1.3 3 3z M21 16a3 3 0 1 1-3-3c1.7 0 3 1.3 3 3z")
+    }
+
     /** 设置 (2.1, sliders) */
     val Settings: ImageVector by lazy { icon("Settings", "M4 7h9 M17 7h3 M15 4.5v5 M4 17h3 M11 17h9 M9 14.5v5") }
 
@@ -130,6 +135,11 @@ object IrisIcons {
 
     /** 附件 · 拍照 (3.0 Beta5) */
     val Camera: ImageVector by lazy { icon("Camera", "M4 8h3l1.5-2.5h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z M12 10a3.5 3.5 0 1 1 0 7a3.5 3.5 0 1 1 0-7z") }
+
+    /** 影片創作 */
+    val Movie: ImageVector by lazy {
+        icon("Movie", "M4 5h16v14H4z M4 9h16 M4 15h16 M8 5v4 M16 5v4 M8 15v4 M16 15v4")
+    }
 
     /** selected swatch */
     val Check: ImageVector by lazy { icon("Check", "M5 12.5l4.5 4.5L19 7.5") }

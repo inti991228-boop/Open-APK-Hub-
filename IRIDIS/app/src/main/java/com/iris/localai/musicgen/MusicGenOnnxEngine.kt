@@ -31,6 +31,7 @@ object MusicGenOnnxEngine {
         output: File,
         durationSeconds: Int = 5,
         seed: Int? = null,
+        onProgress: (Int) -> Unit = {},
         isCancelled: () -> Boolean = { Thread.currentThread().isInterrupted },
     ): Output {
         require(prompt.isNotBlank()) { "Enter a music prompt" }
@@ -57,6 +58,7 @@ object MusicGenOnnxEngine {
         val tokenizer = UnigramTokenizer.fromTokenizerJson(tokenizerFile.readText())
         val textIds = tokenizer.encode(prompt)
         require(textIds.isNotEmpty() && textIds.size <= 1024) { "Prompt is too long for the text encoder" }
+        onProgress(3)
         val environment = OrtEnvironment.getEnvironment()
         val random = seed?.let { Random(it) } ?: Random.Default
         val textOptions = OrtSession.SessionOptions().apply { setIntraOpNumThreads(2) }
@@ -67,6 +69,7 @@ object MusicGenOnnxEngine {
                 environment.createSession(decoderFile.absolutePath, decoderOptions).use { decoderSession ->
                     environment.createSession(codecFile.absolutePath, codecOptions).use { codecSession ->
                         val hidden = encodeText(environment, textSession, textIds, tokenizer.padTokenId())
+                        onProgress(5)
                         val tokenRows = ArrayList<IntArray>(stepCount + codebooks - 1)
                         var previous = IntArray(codebooks) { vocabSize }
                         var past = emptyMap<String, FloatCache>()
@@ -115,6 +118,7 @@ object MusicGenOnnxEngine {
                                     "Merged MusicGen decoder did not return every present_key_values cache"
                                 }
                             }
+                            onProgress(5 + (step + 1) * 80 / (stepCount + codebooks - 1))
                         }
 
                         val audioCodes = IntArray(codebooks * stepCount)
@@ -125,8 +129,10 @@ object MusicGenOnnxEngine {
                         }
                         checkCancelled(isCancelled)
                         val pcm = decodeAudio(environment, codecSession, audioCodes, stepCount, codebooks)
+                        onProgress(92)
                         if (output.exists()) throw IOException("Output file already exists: ${output.name}")
                         PcmWavWriter.writeMono16(output, pcm, 32_000)
+                        onProgress(100)
                         return Output(output, 32_000, pcm.size)
                     }
                 }
