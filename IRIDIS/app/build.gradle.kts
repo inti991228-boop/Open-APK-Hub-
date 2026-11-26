@@ -130,6 +130,8 @@ android {
             // Central into app storage (GenieXRuntime, 设置 › 模型与后端), like the LiteRT NPU runtime.
             // No name overlaps ours (libiris_llama / libiris_mnn / liblitertlm_jni / sherpa).
             excludes += setOf(
+                // The app supports arm64 only; the sherpa AAR's x86 runtime conflicts with ONNX Runtime.
+                "**/x86/libonnxruntime.so",
                 "**/libnpu_jni.so", "**/libgeniex*.so", "**/libllama.so", "**/libllama-common.so", "**/libmtmd.so",
                 "**/libggml*.so", "**/libomp.so", "**/libQnn*.so", "**/libhta_hexagon_runtime_*.so",
                 "**/libPlatformValidatorShared.so", "**/libcalculator.so", "**/libCalculator_skel.so",
