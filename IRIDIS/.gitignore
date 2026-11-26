@@ -1,0 +1,43 @@
+*.iml
+.gradle/
+/local.properties
+/keystore.properties
+*.jks
+*.keystore
+.idea/
+.DS_Store
+/build/
+/app/build/
+/app/.cxx/
+captures/
+.externalNativeBuild/
+*.apk
+*.aab
+# fetched by scripts/fetch-deps.sh
+/third_party/
+# QNN C API headers (Qualcomm license) — fetched, never committed
+third_party/qnn-api/
+/app/libs/*.aar
+
+# never publish signing material
+/keystore/
+*.p12
+
+# Kotlin compiler session data
+.kotlin/
+
+# native libs reused from a released APK (local builds without NDK)
+/prebuilt-native/
+/terminal-plugin/build/
+/build-native/
+
+# 2.2.15: built-in Hexagon runtime assets (scripts/build-llama-htp.sh)
+/prebuilt-assets/
+/build-native-htp/
+
+# 本地交接文档，不入库
+/HANDOFF-STATUS.md
+
+# 2.7.6 vc283: sd.cpp 本机构建目录（scripts/build-sd-native-arm64host.sh），2.7.0 Beta 误提交过
+/build-sd-arm64host/
+build-upscale-arm64host/

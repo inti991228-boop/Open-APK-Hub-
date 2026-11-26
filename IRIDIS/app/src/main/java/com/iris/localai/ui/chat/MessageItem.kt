@@ -1,0 +1,707 @@
+package com.iris.localai.ui.chat
+
+import com.iris.localai.I18n
+import com.iris.localai.IrisApp
+import com.iris.localai.R
+import com.iris.localai.agent.core.Citations
+import com.iris.localai.agent.core.StepStatus
+import com.iris.localai.data.MessageVersions
+import com.iris.localai.knowledge.KbPrompt
+import com.iris.localai.knowledge.KbSource
+import com.iris.localai.ui.agent.AgentSteps
+import com.iris.localai.ui.components.IrisDialog
+import com.iris.localai.ui.components.IrisMenu
+import com.iris.localai.ui.components.IrisMenuItem
+import com.iris.localai.ui.components.ScrollSafeFold
+import com.iris.localai.ui.feedback.FeedbackEvent
+import com.iris.localai.ui.icons.IrisIcons
+import com.iris.localai.ui.theme.IrisSpace
+import com.iris.localai.util.streaming.ReplySpeed
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.VolumeUp
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.Psychology
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.StopCircle
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.unit.dp
+import com.iris.localai.data.ChatMessage
+import com.iris.localai.data.Format
+import com.iris.localai.data.Role
+import com.iris.localai.ui.components.PressableIcon
+import com.iris.localai.ui.components.TypingDots
+import com.iris.localai.ui.components.floatingSurface
+import com.iris.localai.ui.components.pulse
+import com.iris.localai.ui.markdown.Markdown
+import com.iris.localai.ui.theme.Iris
+import com.iris.localai.ui.theme.IrisDimens
+import com.iris.localai.ui.motion.IrisMotion
+import com.iris.localai.ui.theme.IrisRadius
+import com.iris.localai.ui.theme.IrisType
+import com.iris.localai.ui.theme.chatScaled
+import com.iris.localai.ui.theme.LocalReduceMotion
+import com.iris.localai.util.streaming.ParagraphSplitter
+import com.iris.localai.util.streaming.ThinkParseCache
+import com.iris.localai.util.streaming.TypewriterPacer
+import androidx.compose.runtime.derivedStateOf
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
+import java.util.Locale
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun UserMessage(
+    message: ChatMessage,
+    onEdit: () -> Unit,
+    /** 2.0.x: 「记住这条」 (null = hidden). */
+    onRemember: (() -> Unit)? = null,
+    /** 2.0.x: ‹ › between the versions of this message (and the conversation that followed each). */
+    onSwitchVersion: (Int) -> Unit = {},
+    /** 「删除」 (null = hidden). */
+    onDelete: (() -> Unit)? = null,
+) {
+    val c = Iris.colors
+    val clipboard = LocalClipboardManager.current
+    var menu by remember { mutableStateOf(false) }
+    val haptics = com.iris.localai.ui.feedback.rememberIrisFeedback()
+    val translator = rememberTranslator()
+    Box(Modifier.fillMaxWidth().padding(start = 52.dp), contentAlignment = Alignment.CenterEnd) {
+      Column(horizontalAlignment = Alignment.End) {
+        // attached pictures / files above the bubble.
+        if (message.attachments.isNotEmpty()) {
+            AttachmentStrip(message.attachments, modifier = Modifier.padding(bottom = if (message.content.isNotBlank()) IrisDimens.space6 else 0.dp))
+        }
+        // 2.2 「技能」: the skills / tools this message pointed the agent at.
+        if (message.refs.isNotEmpty()) {
+            Text(
+                message.refs.joinToString("  ") { it.token },
+                style = IrisType.labelSmall, color = c.accent, maxLines = 2,
+                modifier = Modifier.padding(end = IrisDimens.space4, bottom = IrisDimens.space4),
+            )
+        }
+        if (message.content.isNotBlank()) Box(
+            Modifier
+                .clip(IrisRadius.bubbleShape)
+                .background(c.surfaceVariant)
+                .combinedClickable(
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null, // r4：长按不再留大圆水波影子
+                    onClick = {}, onLongClick = {
+                    haptics.perform(FeedbackEvent.LONG_PRESS); menu = true
+                })
+                .padding(horizontal = IrisDimens.space16, vertical = IrisSpace.S),
+        ) {
+            Text(message.content, style = IrisType.message.chatScaled(), color = c.text)
+        }
+        TranslationBlock(message.id)
+        VersionSwitcher(message, onSwitchVersion)
+      }
+        IrisMenu(menu, { menu = false }) {
+            IrisMenuItem(I18n.s(R.string.ui_79d3ab), Icons.Outlined.ContentCopy) { clipboard.setText(AnnotatedString(message.content)); menu = false }
+            IrisMenuItem(TranslateText.TRANSLATE, IrisIcons.Translate) { menu = false; translator.translateMessage(message.id, message.content) }
+            IrisMenuItem(I18n.s(R.string.chat_27a36e), Icons.Outlined.Edit) { menu = false; onEdit() }
+            if (onRemember != null) IrisMenuItem(VersionText.REMEMBER, IrisIcons.Memory) { menu = false; onRemember() }
+            if (onDelete != null) IrisMenuItem(I18n.s(R.string.del244_delete), Icons.Outlined.DeleteOutline, destructive = true) { menu = false; onDelete() }
+        }
+    }
+}
+
+/**
+ * An assistant reply. While [streaming], its text comes from [streamText] (read only inside the
+ * thinking / answer sub-scopes, so a new token never recomposes the whole message or the list),
+ * is parsed incrementally ([ThinkParseCache]) and is revealed at an even, backlog-adaptive pace.
+ */
+@Composable
+fun AssistantMessage(
+    message: ChatMessage,
+    streaming: Boolean,
+    isLast: Boolean,
+    expectThinking: Boolean,
+    speaking: Boolean,
+    onRegenerate: () -> Unit,
+    onSpeak: () -> Unit,
+    onStopSpeaking: () -> Unit,
+    streamText: () -> String? = { null },
+    /** what the reply waits for before its first text (e.g. 「正在重载模型…」). */
+    status: String? = null,
+    /** opens 「查看提示内容」 (null = hidden). */
+    onShowPrompt: (() -> Unit)? = null,
+    /** 2.0.x: edit this reply in place (null = hidden). */
+    onEdit: (() -> Unit)? = null,
+    /** 2.0.x: 「记住这条」 (null = hidden). */
+    onRemember: (() -> Unit)? = null,
+    /** 2.0.x: ‹ › between the versions of this reply. */
+    onSwitchVersion: (Int) -> Unit = {},
+    /** 「＋ 记住？」 chip (shown when [ChatMessage.memorySuggestion] is set). */
+    onAcceptMemory: (() -> Unit)? = null,
+    onDismissMemory: (() -> Unit)? = null,
+    /** 「删除」 in ⋯ (null = hidden). */
+    onDelete: (() -> Unit)? = null,
+) {
+    val c = Iris.colors
+    val cache = remember(message.id) { ThinkParseCache() }
+    val parts = remember(message.id, message.content, streaming, expectThinking) {
+        derivedStateOf { if (streaming) cache.parseStreaming(streamText() ?: message.content, expectThinking) else cache.parse(message.content) }
+    }
+    // While a thinking reply starts, show the (empty) thinking block right away instead of typing
+    // dots that are then swapped for the block: one layout from the first frame, no jump.
+    // while a tool runs (or waits for you) its card is the live part; no empty 思考中 below it.
+    val stepActive = streaming && message.agentSteps.lastOrNull()?.status.let {
+        it == StepStatus.RUNNING || it == StepStatus.ASKING
+    }
+    val hasThinking by remember(parts, streaming, expectThinking, stepActive) {
+        derivedStateOf { parts.value.hasThinking || (streaming && !stepActive && expectThinking && parts.value.answer.isEmpty()) }
+    }
+    val hasAnswer by remember(parts) { derivedStateOf { parts.value.answer.isNotEmpty() } }
+    // D 引用链接: web_search sources of this reply (inline [n] links + 来源 row).
+    val sources = remember(message.agentSteps, streaming) { if (streaming) emptyList() else Citations.fromSteps(message.agentSteps) }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
+        // 智能体: tool steps of this reply, above the reasoning and the answer.
+        AgentSteps(message.agentSteps, streaming) { st ->
+            val lp = remember(st.lead) { ThinkParseCache().parse(st.lead) }
+            Column(verticalArrangement = Arrangement.spacedBy(IrisDimens.space4)) {
+                if (lp.thinking.isNotBlank()) ThinkingBlock({ lp.thinking }, { false }, streaming = false, elapsedMs = 0L, initiallyExpanded = false)
+                if (lp.answer.isNotBlank()) AnswerBody(text = { lp.answer }, streaming = false)
+            }
+        }
+        if (hasThinking) {
+            ThinkingBlock(
+                text = { parts.value.thinking },
+                inProgress = { streaming && (parts.value.thinkingOpen || (!parts.value.hasThinking && parts.value.answer.isEmpty())) },
+                streaming = streaming,
+                elapsedMs = message.thinkingMs,
+                answerStarted = hasAnswer,
+            )
+        }
+        when {
+            hasAnswer -> AnswerBody(text = { parts.value.answer }, streaming = streaming, sources = sources)
+            stepActive -> {}
+            streaming && !hasThinking && status != null -> Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(IrisDimens.space8),
+            ) {
+                TypingDots()
+                Text(status, style = IrisType.secondary, color = c.textSecondary)
+            }
+            streaming && !hasThinking -> TypingDots()
+        }
+        message.error?.let { err ->
+            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(IrisDimens.space6)) {
+                Icon(Icons.Outlined.ErrorOutline, null, tint = c.danger, modifier = Modifier.padding(top = IrisDimens.space2).size(18.dp))
+                MessageSelection { Text(err, style = IrisType.secondary, color = c.danger) }
+            }
+        }
+        // Fades in once the reply is complete; history messages show it immediately.
+        AnimatedVisibility(
+            visible = !streaming && (hasAnswer || message.error != null),
+            enter = fadeIn(IrisMotion.enter()),
+            exit = fadeOut(IrisMotion.standard()),
+        ) {
+            Column {
+                TranslationBlock(message.id)
+                VersionSwitcher(message, onSwitchVersion)
+                ActionRow(message, parts.value.answer, isLast, speaking, onRegenerate, onSpeak, onStopSpeaking, onShowPrompt, onEdit, onRemember, onDelete = onDelete)
+                // only the snippets the reply really cites (file name or [n]); none → no chips.
+                val citedKb = remember(message.content, message.kbSources) { KbPrompt.cited(message.content, message.kbSources) }
+                if (citedKb.isNotEmpty()) KbSourceChips(citedKb)
+                if (sources.isNotEmpty()) WebSourceChips(sources)
+                val suggestion = message.memorySuggestion
+                if (suggestion != null && onAcceptMemory != null) {
+                    MemorySuggestionChip(suggestion, onAcceptMemory, onDismissMemory ?: {})
+                }
+            }
+        }
+    }
+}
+
+/** The visible answer: smooth reveal + incremental Markdown while streaming. */
+@Composable
+private fun AnswerBody(text: () -> String, streaming: Boolean, sources: List<Citations.Source> = emptyList()) {
+    val revealed by rememberRevealedText(text, animate = streaming)
+    val shown = if (streaming || sources.isEmpty()) revealed else remember(revealed, sources) { Citations.linkify(revealed, sources) }
+    // a finished reply is selectable — long-press, drag the handles, copy just a part.
+    // (Not while streaming: the text changes under the selection.)
+    if (streaming) Markdown(shown, streaming = true)
+    else MessageSelection { Markdown(shown, streaming = false) }
+}
+
+/**
+ * Reveals [target] at the pace of a [TypewriterPacer] driven by the frame clock while [animate];
+ * otherwise (finished message, or system animations off) shows it as is. Starts from what is
+ * already there, so a reply scrolled back into view is not typed out again.
+ */
+@Composable
+internal fun rememberRevealedText(target: () -> String, animate: Boolean): androidx.compose.runtime.State<String> {
+    val reduce = LocalReduceMotion.current
+    val live = animate && !reduce
+    val pacer = remember { TypewriterPacer() }
+    // A block that just appeared while streaming types from its first character; a reply scrolled
+    // back into view keeps what it already showed.
+    val shownLen = remember { androidx.compose.runtime.mutableIntStateOf(target().length.let { if (live && it <= FRESH_BLOCK_CHARS) 0 else it }) }
+    val currentTarget by androidx.compose.runtime.rememberUpdatedState(target)
+    if (live) {
+        LaunchedEffect(Unit) {
+            @Suppress("NAME_SHADOWING") val target = { currentTarget() }
+            pacer.reset(shownLen.intValue)
+            var last = 0L
+            var origin = 0L
+            while (true) {
+                val len = target().length
+                if (shownLen.intValue == len) {
+                    // Caught up: sleep until more text arrives (no per-frame work while idle).
+                    androidx.compose.runtime.snapshotFlow { target().length }.first { it != shownLen.intValue }
+                    last = 0L
+                    continue
+                }
+                androidx.compose.runtime.withFrameNanos { now ->
+                    val dt = if (last == 0L) 1f / 60f else (now - last) / 1e9f
+                    last = now
+                    // The clock lets the pacer measure the real arrival speed (see TypewriterPacer).
+                    if (origin == 0L) origin = now
+                    shownLen.intValue = pacer.step(target().length, dt, done = false, nowSec = (now - origin) / 1e9f)
+                }
+                // ~40 reveals a second instead of one per vsync (120 Hz): each reveal re-lays
+                // out the last Markdown block, and the eye cannot tell the difference.
+                kotlinx.coroutines.delay(REVEAL_GAP_MS)
+            }
+        }
+    }
+    return remember(live, target) {
+        derivedStateOf {
+            val t = target()
+            if (!live) t else {
+                var n = shownLen.intValue.coerceIn(0, t.length)
+                if (n in 1 until t.length && t[n - 1].isHighSurrogate()) n-- // never split an emoji
+                t.substring(0, n)
+            }
+        }
+    }
+}
+
+/** A streamed block shorter than this when it first appears is typed from its first character. */
+private const val FRESH_BLOCK_CHARS = 48
+private const val REVEAL_GAP_MS = 22L
+
+/** labels of the assistant action bar's overflow. */
+internal object ActionRowText {
+    val MORE: String get() = I18n.s(R.string.chat_fff96e)
+    val SHOW_PROMPT: String get() = I18n.s(R.string.chat_48ba23)
+}
+
+@Composable
+private fun ActionRow(
+    message: ChatMessage,
+    answer: String,
+    isLast: Boolean,
+    speaking: Boolean,
+    onRegenerate: () -> Unit,
+    onSpeak: () -> Unit,
+    onStopSpeaking: () -> Unit,
+    onShowPrompt: (() -> Unit)? = null,
+    onEdit: (() -> Unit)? = null,
+    onRemember: (() -> Unit)? = null,
+    onDelete: (() -> Unit)? = null,
+) {
+    val c = Iris.colors
+    val clipboard = LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) { if (copied) { delay(1500); copied = false } }
+    val meta = remember(message.outputChars, message.outputMs, message.totalMs, message.interrupted, message.stats, message.edited, message.kbRefs, message.content) {
+        buildList {
+            if (message.edited) add(VersionText.EDITED)
+            if (message.kbRefs > 0 && message.kbSources.isEmpty() && KbPrompt.citesAny(message.content, message.kbRefs)) add(KbPrompt.chip(message.kbRefs))
+            if (message.interrupted) add(I18n.s(R.string.chat_829778))
+            // Measured for this reply on the device: output speed (first char → end) and total time.
+            ReplySpeed.format(message.outputChars, message.outputMs, message.totalMs,
+                message.stats?.takeIf { it.generatedTokens >= 8 && it.generateMs >= 300 }?.tokensPerSecond ?: 0f)?.let { add(it) }
+        }.joinToString(" · ")
+    }
+    // Icons sit flush with the text column: the first button's ripple starts at the text edge.
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 0.dp).height(40.dp)) {
+        val iconSize = 18.dp
+        PressableIcon(
+            if (copied) Icons.Outlined.Check else Icons.Outlined.ContentCopy, if (copied) I18n.s(R.string.chat_52e6ab) else I18n.s(R.string.ui_79d3ab),
+            size = 40.dp, iconSize = iconSize, tint = c.textSecondary, haptic = true,
+            modifier = Modifier.padding(end = IrisDimens.space2),
+        ) { clipboard.setText(AnnotatedString(answer)); copied = true }
+        if (isLast) {
+            PressableIcon(Icons.Outlined.Refresh, I18n.s(R.string.chat_a7c232), size = 40.dp, iconSize = iconSize, tint = c.textSecondary, onClick = onRegenerate)
+        }
+        PressableIcon(
+            if (speaking) Icons.Outlined.StopCircle else Icons.AutoMirrored.Outlined.VolumeUp,
+            if (speaking) I18n.s(R.string.chat_b9082b) else I18n.s(R.string.chat_f9ab1f),
+            size = 40.dp, iconSize = iconSize, tint = if (speaking) c.text else c.textSecondary,
+            modifier = Modifier.pulse(speaking, min = 0.55f),
+            onClick = if (speaking) onStopSpeaking else onSpeak,
+        )
+        // low-frequency actions live behind ⋯ so the bar stays short.
+        run {
+            var overflow by remember { mutableStateOf(false) }
+            val translator = rememberTranslator()
+            Box {
+                PressableIcon(IrisIcons.More, ActionRowText.MORE, size = 40.dp, iconSize = iconSize, tint = c.textSecondary) { overflow = true }
+                IrisMenu(overflow, { overflow = false }) {
+                    // translate the answer (thinking excluded), shown under the reply.
+                    if (answer.isNotBlank()) IrisMenuItem(TranslateText.TRANSLATE, IrisIcons.Translate) { overflow = false; translator.translateMessage(message.id, answer) }
+                    if (onEdit != null) IrisMenuItem(VersionText.EDIT_REPLY, IrisIcons.Edit) { overflow = false; onEdit() }
+                    if (onRemember != null) IrisMenuItem(VersionText.REMEMBER, IrisIcons.Memory) { overflow = false; onRemember() }
+                    if (onShowPrompt != null) IrisMenuItem(ActionRowText.SHOW_PROMPT, IrisIcons.Prompt) { overflow = false; onShowPrompt() }
+                    if (onDelete != null) IrisMenuItem(I18n.s(R.string.del244_delete), Icons.Outlined.DeleteOutline, destructive = true) { overflow = false; onDelete() }
+                }
+            }
+        }
+        if (meta.isNotEmpty()) {
+            Spacer(Modifier.width(IrisDimens.space6))
+            Text(
+                meta, style = IrisType.caption, color = c.textTertiary, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ThinkingBlock(text: () -> String, inProgress: () -> Boolean, streaming: Boolean, elapsedMs: Long, initiallyExpanded: Boolean = true, answerStarted: Boolean = false) {
+    val c = Iris.colors
+    var expanded by rememberSaveable { mutableStateOf(initiallyExpanded) }
+    // 思考自动收起：本条正在生成、正文刚开始输出时收起一次（之后用户再点开不再干预）
+    if (streaming) {
+        val autoFold = rememberAutoFoldThinking()
+        androidx.compose.runtime.LaunchedEffect(answerStarted, autoFold) {
+            if (ThinkFold.shouldFold(autoFold, streaming, answerStarted)) expanded = false
+        }
+    }
+    val reduce = LocalReduceMotion.current
+    val arrow by animateFloatAsState(if (expanded) 180f else 0f, if (reduce) snap() else IrisMotion.standard(), label = "thinkArrow")
+    val thinking by remember(inProgress) { derivedStateOf { inProgress() } }
+    val hasText by remember(text) { derivedStateOf { text().isNotBlank() } }
+    Column {
+        Row(
+            Modifier
+                .heightIn(min = 36.dp)
+                .clip(IrisRadius.smallShape)
+                .clickable { expanded = !expanded }
+                .padding(horizontal = IrisDimens.space6),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(IrisDimens.space6),
+        ) {
+            Icon(IrisIcons.Think, null, tint = c.textSecondary, modifier = Modifier.size(IrisDimens.iconSmall + IrisDimens.space2))
+            val title = when {
+                thinking -> I18n.s(R.string.chat_234bae)
+                elapsedMs > 0 -> I18n.s(R.string.chat_78b04b, Format.seconds(elapsedMs))
+                else -> I18n.s(R.string.chat_6df621)
+            }
+            // 2.7.4：「正在思考」轻微呼吸 + 流光；结束时标题淡入淡出切换，不闪。
+            androidx.compose.animation.Crossfade(
+                targetState = title, animationSpec = if (reduce) snap() else IrisMotion.standard(), label = "thinkTitle",
+                modifier = Modifier.weight(1f, fill = false),
+            ) { t ->
+                Text(
+                    t, style = IrisType.label, color = c.textSecondary,
+                    maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    modifier = Modifier.pulse(thinking, min = ThinkMotion.PULSE_MIN, periodMs = ThinkMotion.PULSE_MS).thinkShimmer(thinking && !reduce),
+                )
+            }
+            Icon(
+                Icons.Outlined.KeyboardArrowDown, if (expanded) I18n.s(R.string.chat_83cb1e) else I18n.s(R.string.chat_fedcac),
+                tint = c.textTertiary, modifier = Modifier.size(18.dp).graphicsLayer { rotationZ = arrow },
+            )
+        }
+        // While thinking streams the body is already there (one line tall), so the first words do
+        // not arrive together with an expand animation of a container that is still growing.
+        // jumps to its end as soon as the list scrolls (garbled text under a fling mid-animation).
+        ScrollSafeFold(visible = expanded && (hasText || (streaming && thinking))) {
+            Row(Modifier.padding(start = IrisDimens.space6, top = IrisDimens.space4).height(IntrinsicSize.Min)) {
+                Box(Modifier.width(IrisDimens.space2).fillMaxHeight().clip(IrisRadius.pillShape).background(c.outline))
+                ThinkingParagraphs(text, animate = streaming && thinking, modifier = Modifier.padding(start = IrisDimens.space12))
+            }
+        }
+    }
+}
+
+/** 2.7.4：思考标题动效参数（纯常量，单测）。 */
+object ThinkMotion {
+    /** 呼吸最暗透明度（原 0.4 偏重，改轻）。 */
+    const val PULSE_MIN = 0.6f
+    const val PULSE_MS = 1100
+    /** 流光扫过一次的时长。 */
+    const val SHIMMER_MS = 1600
+    /** 流光位置 [t]∈[0,1) → 高光中心在宽度上的比例（从左外到右外）。 */
+    fun shimmerX(t: Float): Float = -0.3f + 1.6f * t.coerceIn(0f, 1f)
+}
+
+/** 生成中的思考标题：一道淡淡的高光从左扫到右（只画在文字上，不改布局）。 */
+@Composable
+private fun Modifier.thinkShimmer(enabled: Boolean): Modifier {
+    if (!enabled || !com.iris.localai.ui.motion.LocalDecorativeMotion.current) return this
+    val tr = androidx.compose.animation.core.rememberInfiniteTransition(label = "thinkShimmer")
+    val t by tr.animateFloat(
+        0f, 1f,
+        androidx.compose.animation.core.infiniteRepeatable(androidx.compose.animation.core.tween<Float>(ThinkMotion.SHIMMER_MS, easing = androidx.compose.animation.core.LinearEasing)),
+        label = "thinkShimmerT",
+    )
+    val hi = Iris.colors.text
+    return this
+        .graphicsLayer { compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen }
+        .drawWithContent {
+            drawContent()
+            val cx = size.width * ThinkMotion.shimmerX(t)
+            val half = size.width * 0.25f
+            drawRect(
+                androidx.compose.ui.graphics.Brush.horizontalGradient(
+                    listOf(Color.Transparent, hi.copy(alpha = 0.55f), Color.Transparent), startX = cx - half, endX = cx + half,
+                ),
+                blendMode = androidx.compose.ui.graphics.BlendMode.SrcAtop,
+            )
+        }
+}
+
+/**
+ * Thinking text as one Text per paragraph: finished paragraphs keep the same String, so Compose
+ * skips them and never lays them out again; only the last paragraph re-wraps as text streams in.
+ */
+@Composable
+private fun ThinkingParagraphs(text: () -> String, animate: Boolean, modifier: Modifier = Modifier) {
+    val c = Iris.colors
+    val shown by rememberRevealedText(text, animate)
+    val splitter = remember { ParagraphSplitter() }
+    val paragraphs = remember(shown) { splitter.split(shown) }
+    val style = IrisType.secondary.copy(lineHeight = IrisType.message.lineHeight.times(0.88f)).chatScaled()
+    val lineMin = with(androidx.compose.ui.platform.LocalDensity.current) { style.lineHeight.toDp() }
+    Column(modifier.heightIn(min = if (animate) lineMin else 0.dp), verticalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
+        paragraphs.forEachIndexed { i, p ->
+            androidx.compose.runtime.key(i) { Text(p, style = style, color = c.textSecondary) }
+        }
+    }
+}
+
+/**
+ * Wraps one chat message. Messages created just now rise and fade into place; messages loaded
+ * from history (or recycled while scrolling) render immediately. graphicsLayer only.
+ */
+@Composable
+fun MessageRow(message: ChatMessage, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    val reduce = LocalReduceMotion.current
+    val fresh = remember(message.id) { !reduce && System.currentTimeMillis() - message.createdAt < 1500 }
+    val rise = remember(message.id) { Animatable(if (fresh) 0f else 1f) }
+    if (fresh) LaunchedEffect(message.id) { rise.animateTo(1f, IrisMotion.Gentle.float()) }
+    val user = message.role == Role.USER
+    Box(
+        modifier
+            .fillMaxWidth()
+            .widthIn(max = IrisDimens.messageMaxWidth)
+            .padding(horizontal = IrisSpace.L)
+            .graphicsLayer {
+                val v = rise.value
+                alpha = v.coerceIn(0f, 1f)
+                translationY = (1f - v) * 14.dp.toPx()
+                if (user) {
+                    val s = 0.94f + 0.06f * v
+                    scaleX = s; scaleY = s
+                    transformOrigin = TransformOrigin(1f, 1f)
+                }
+            },
+    ) { content() }
+}
+
+fun ChatMessage.isUser() = role == Role.USER
+
+/** 2.0.x: labels of the message-version switcher and the new message actions. */
+object VersionText {
+    val PREV: String get() = I18n.s(R.string.chat_b54f81)
+    val NEXT: String get() = I18n.s(R.string.chat_4630a8)
+    val EDIT_REPLY: String get() = I18n.s(R.string.chat_3d23ae)
+    val EDITED: String get() = I18n.s(R.string.chat_9b7287)
+    val REMEMBER: String get() = I18n.s(R.string.chat_15bc4e)
+    /** 0-based [active] of [count] → "2/3". */
+    fun label(active: Int, count: Int): String = "${active + 1}/$count"
+}
+
+/** 2.0.x: compact ‹ 2/3 › under a message with more than one version; nothing otherwise. */
+@Composable
+fun VersionSwitcher(message: ChatMessage, onSwitch: (Int) -> Unit, modifier: Modifier = Modifier) {
+    val n = MessageVersions.count(message)
+    if (n < 2) return
+    val i = MessageVersions.active(message)
+    val c = Iris.colors
+    Row(modifier.height(IrisDimens.space32), verticalAlignment = Alignment.CenterVertically) {
+        PressableIcon(
+            IrisIcons.ChevronLeft, VersionText.PREV, size = IrisDimens.space32, iconSize = IrisDimens.space16,
+            tint = c.textSecondary, enabled = i > 0, haptic = true,
+        ) { onSwitch(i - 1) }
+        Text(VersionText.label(i, n), style = IrisType.caption, color = c.textSecondary, maxLines = 1)
+        PressableIcon(
+            IrisIcons.ChevronRight, VersionText.NEXT, size = IrisDimens.space32, iconSize = IrisDimens.space16,
+            tint = c.textSecondary, enabled = i < n - 1, haptic = true,
+        ) { onSwitch(i + 1) }
+    }
+}
+
+/** texts of the 「记住？」 chip. */
+internal object MemoryChipText {
+    val DISMISS: String get() = I18n.s(R.string.chat_c0d5d6)
+    fun label(text: String): String { val t = if (text.length > 24) text.take(23) + Typography.ellipsis else text; return I18n.s(R.string.chat_664f6a, t) }
+}
+
+/** 「＋ 记住？「…」」 under a finished reply: tap saves, ✕ / long press ignores. */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun MemorySuggestionChip(text: String, onAccept: () -> Unit, onDismiss: () -> Unit) {
+    val c = Iris.colors
+    Row(
+        Modifier
+            .padding(top = IrisDimens.space4)
+            .clip(IrisRadius.pillShape)
+            .background(c.accentContainer)
+            .combinedClickable(onClick = onAccept, onLongClick = onDismiss)
+            .heightIn(min = 32.dp)
+            .padding(start = IrisDimens.space12, end = IrisDimens.space4),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            MemoryChipText.label(text), style = IrisType.secondary, color = c.onAccentContainer, maxLines = 1,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
+        )
+        PressableIcon(Icons.Outlined.Close, MemoryChipText.DISMISS, size = 32.dp, iconSize = 16.dp, tint = c.onAccentContainer, onClick = onDismiss)
+    }
+}
+
+/** D4: 「出处：租房合同.md · 第 3 段」 chips; a tap shows the snippet. */
+/** D: 「来源」 under a web_search answer — number + title + domain, tap opens the page. */
+@Composable
+private fun WebSourceChips(sources: List<Citations.Source>) {
+    val c = Iris.colors
+    val uri = androidx.compose.ui.platform.LocalUriHandler.current
+    Row(
+        Modifier.fillMaxWidth().padding(top = IrisDimens.space4).horizontalScroll(rememberScrollState()),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(IrisDimens.space8),
+    ) {
+        Text(I18n.s(R.string.chat_26ca20), style = IrisType.caption, color = c.textTertiary)
+        sources.forEach { s ->
+            Text(
+                "${s.n} · ${s.title.take(18)}${if (s.title.length > 18) "…" else ""} · ${s.domain}",
+                style = IrisType.caption, color = c.textSecondary, maxLines = 1,
+                modifier = Modifier
+                    .widthIn(max = 260.dp)
+                    .clip(IrisRadius.pillShape)
+                    .background(c.surfaceVariant)
+                    .clickable { runCatching { uri.openUri(s.url) } }
+                    .heightIn(min = 32.dp)
+                    .padding(horizontal = IrisDimens.space12, vertical = IrisDimens.space8),
+            )
+        }
+    }
+}
+
+@Composable
+private fun KbSourceChips(sources: List<String>) {
+    val c = Iris.colors
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var open by remember { mutableStateOf<String?>(null) }
+    @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+    androidx.compose.foundation.layout.FlowRow(
+        Modifier.padding(top = IrisDimens.space4),
+        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(IrisDimens.space8),
+        verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(IrisDimens.space8),
+    ) {
+        sources.forEach { label ->
+            Text(
+                KbSource.chip(label), style = IrisType.caption, color = c.textSecondary, maxLines = 1,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .clip(IrisRadius.pillShape)
+                    .background(c.surfaceVariant)
+                    .clickable { open = label }
+                    .heightIn(min = 32.dp)
+                    .padding(horizontal = IrisDimens.space12, vertical = IrisDimens.space8),
+            )
+        }
+    }
+    open?.let { label ->
+        val text by androidx.compose.runtime.produceState<String?>(null, label) {
+            value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val (file, idx) = KbSource.parse(label)
+                runCatching { (context.applicationContext as IrisApp).container.agent.knowledge.chunksOf(file).getOrNull(idx) }.getOrNull().orEmpty()
+            }
+        }
+        IrisDialog(
+            onDismiss = { open = null }, title = label, confirmText = I18n.s(R.string.ui_b15d91), onConfirm = { open = null }, dismissText = null,
+        ) {
+            androidx.compose.foundation.layout.Box(Modifier.heightIn(max = 360.dp).verticalScroll(androidx.compose.foundation.rememberScrollState())) {
+                Text(
+                    when (val t = text) { null -> I18n.s(R.string.chat_62a33a); "" -> I18n.s(R.string.chat_9a6156); else -> t },
+                    style = IrisType.body, color = c.text,
+                )
+            }
+        }
+    }
+}
+
+/** 思考自动收起：何时收起。纯函数，单测覆盖。 */
+internal object ThinkFold {
+    fun shouldFold(enabled: Boolean, streaming: Boolean, answerStarted: Boolean): Boolean = enabled && streaming && answerStarted
+}
+
+@Composable
+private fun rememberAutoFoldThinking(): Boolean {
+    val app = androidx.compose.ui.platform.LocalContext.current.applicationContext as? IrisApp ?: return false
+    val s by app.container.settings.settings.collectAsStateWithLifecycle()
+    return s.autoFoldThinking
+}

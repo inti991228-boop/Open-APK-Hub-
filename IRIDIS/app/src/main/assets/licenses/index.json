@@ -1,0 +1,200 @@
+[
+  {
+    "name": "IRIDIS (IRIS LocalAI)",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": ""
+  },
+  {
+    "name": "llama.cpp / ggml",
+    "license": "MIT",
+    "file": "mit-llama.cpp.txt",
+    "url": "https://github.com/ggml-org/llama.cpp/tree/785322d17f2d51e5185cf996a1f4e46d87640841"
+  },
+  {
+    "name": "nlohmann/json",
+    "license": "MIT",
+    "file": "mit-nlohmann-json.txt",
+    "url": "https://github.com/nlohmann/json"
+  },
+  {
+    "name": "cpp-httplib",
+    "license": "MIT",
+    "file": "mit-cpp-httplib.txt",
+    "url": "https://github.com/yhirose/cpp-httplib"
+  },
+  {
+    "name": "MNN (modified)",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://github.com/alibaba/MNN"
+  },
+  {
+    "name": "LiteRT-LM",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://github.com/google-ai-edge/LiteRT-LM"
+  },
+  {
+    "name": "LiteRT Dispatch (Qualcomm)",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://github.com/google-ai-edge/LiteRT"
+  },
+  {
+    "name": "sherpa-onnx",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://github.com/k2-fsa/sherpa-onnx"
+  },
+  {
+    "name": "ONNX Runtime",
+    "license": "MIT",
+    "file": "mit-onnxruntime.txt",
+    "url": "https://github.com/microsoft/onnxruntime"
+  },
+  {
+    "name": "Khronos OpenCL Headers",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://github.com/KhronosGroup/OpenCL-Headers"
+  },
+  {
+    "name": "AndroidX / Jetpack Compose / Material Icons",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://developer.android.com/jetpack/androidx"
+  },
+  {
+    "name": "Kotlin stdlib / kotlinx.coroutines / kotlinx.serialization",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://github.com/JetBrains/kotlin"
+  },
+  {
+    "name": "Apache Commons Compress 1.27.1",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://commons.apache.org/proper/commons-compress/"
+  },
+  {
+    "name": "Apache Commons IO",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://commons.apache.org/proper/commons-io/"
+  },
+  {
+    "name": "Apache Commons Lang3",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://commons.apache.org/proper/commons-lang/"
+  },
+  {
+    "name": "Apache Commons Codec",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://commons.apache.org/proper/commons-codec/"
+  },
+  {
+    "name": "Apache Commons NOTICE",
+    "license": "NOTICE",
+    "file": "notice-apache-commons.txt",
+    "url": ""
+  },
+  {
+    "name": "Silero VAD",
+    "license": "MIT",
+    "file": "mit-silero-vad.txt",
+    "url": "https://github.com/snakers4/silero-vad"
+  },
+  {
+    "name": "Qualcomm GenieX (Kotlin SDK classes)",
+    "license": "BSD-3-Clause; native runtime: Qualcomm Terms of Use (downloaded by the user)",
+    "file": "bsd-3-geniex.txt",
+    "url": "https://github.com/qualcomm/GenieX"
+  },
+  {
+    "name": "RhineLabUI（设计灵感，未使用其代码）",
+    "license": "MIT",
+    "file": "mit-rhinelabui.txt",
+    "url": "https://github.com/LBEILC/RhineLabUI"
+  },
+  {
+    "name": "Local Dream (xororz/local-dream) — 生图 NPU 管线 / Anything V5 NPU 模型",
+    "license": "CC BY-NC 4.0",
+    "file": "cc-by-nc-4.0-local-dream.txt",
+    "url": "https://github.com/xororz/local-dream"
+  },
+  {
+    "name": "Anything V5.0（动漫生图模型）",
+    "license": "CreativeML OpenRAIL-M",
+    "file": "creativeml-openrail-m.txt",
+    "url": "https://huggingface.co/xororz/sd-qnn"
+  },
+  {
+    "name": "Stable Diffusion v1.5（Qualcomm AI Hub QNN）",
+    "license": "CreativeML OpenRAIL-M",
+    "file": "creativeml-openrail-m.txt",
+    "url": "https://aihub.qualcomm.com/models/stable_diffusion_v1_5"
+  },
+  {
+    "name": "three.js (r170)",
+    "license": "MIT",
+    "file": "mit-three.js.txt",
+    "url": "https://github.com/mrdoob/three.js/tree/r170"
+  },
+  {
+    "name": "Mika (GUI agent ideas and code, modified)",
+    "license": "Apache-2.0",
+    "file": "notice-mika.txt",
+    "url": "https://github.com/wangzan101/mika"
+  },
+  {
+    "name": "bergamot-translator (offline translation engine)",
+    "license": "MPL-2.0",
+    "file": "mpl-2.0-bergamot.txt",
+    "url": "https://github.com/browsermt/bergamot-translator/tree/9271618ebbdc5d21ac4dc4df9e72beb7ce644774"
+  },
+  {
+    "name": "Marian NMT (browsermt fork)",
+    "license": "MIT",
+    "file": "mit-marian.txt",
+    "url": "https://github.com/browsermt/marian-dev/tree/2781d735d4a10dca876d61be587afdab2726293c"
+  },
+  {
+    "name": "ruy / SentencePiece / ssplit-cpp",
+    "license": "Apache-2.0",
+    "file": "apache-2.0.txt",
+    "url": "https://github.com/google/ruy"
+  },
+  {
+    "name": "PCRE2",
+    "license": "BSD-3-Clause",
+    "file": "bsd-pcre2.txt",
+    "url": "https://github.com/PCRE2Project/pcre2"
+  },
+  {
+    "name": "yaml-cpp",
+    "license": "MIT",
+    "file": "mit-yaml-cpp.txt",
+    "url": "https://github.com/jbeder/yaml-cpp"
+  },
+  {
+    "name": "zlib",
+    "license": "Zlib",
+    "file": "zlib-notice.txt",
+    "url": "https://zlib.net"
+  },
+  {
+    "name": "Firefox Translations models (zh↔en, downloaded on demand)",
+    "license": "MPL-2.0",
+    "file": "translation-models-notice.txt",
+    "url": "https://github.com/mozilla/firefox-translations-models"
+  },
+  {
+    "name": "hexanima (latent preview coefficients, LoRA header checks)",
+    "license": "MIT",
+    "file": "mit-hexanima.txt",
+    "url": "https://github.com/ayanoby/hexanima"
+  }
+]

@@ -1,0 +1,697 @@
+package com.iris.localai.ui.toolbox
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.foundation.text.selection.SelectionContainer
+import com.iris.localai.ui.components.Fold
+import com.iris.localai.ui.components.rememberLast
+import com.iris.localai.ui.motion.IrisMotion
+import com.iris.localai.ui.motion.motion
+import com.iris.localai.ui.theme.LocalReduceMotion
+
+import androidx.compose.ui.draw.clip
+
+import androidx.compose.foundation.horizontalScroll
+
+import android.content.Intent
+import android.media.MediaPlayer
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.iris.localai.I18n
+import com.iris.localai.R
+import com.iris.localai.floating.FloatingService
+import com.iris.localai.musicgen.MusicGenOnnxEngine
+import com.iris.localai.musicgen.ImportedMusicModel
+import com.iris.localai.musicgen.MusicModelLibrary
+import com.iris.localai.musicgen.MusicModelSource
+import com.iris.localai.onnx.OnnxBundle
+import com.iris.localai.onnx.OnnxBundleLibrary
+import com.iris.localai.ui.chat.ChatViewModel
+import com.iris.localai.ui.components.IrisButton
+import com.iris.localai.ui.components.IrisButtonStyle
+import com.iris.localai.ui.components.IrisCard
+import com.iris.localai.ui.components.ScrollBody
+import com.iris.localai.ui.components.SectionTitle
+import com.iris.localai.ui.components.SettingsGroup
+import com.iris.localai.ui.components.SettingsRow
+import com.iris.localai.ui.components.SliderRow
+import com.iris.localai.ui.components.SubpageScaffold
+import com.iris.localai.ui.components.SwitchRow
+import com.iris.localai.ui.components.irisTextFieldColors
+import com.iris.localai.ui.feedback.FeedbackEvent
+import com.iris.localai.ui.feedback.rememberIrisFeedback
+import com.iris.localai.ui.icons.IrisIcons
+import com.iris.localai.ui.theme.Iris
+import com.iris.localai.ui.theme.IrisDimens
+import com.iris.localai.ui.theme.IrisRadius
+import com.iris.localai.ui.theme.IrisType
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.IOException
+import java.io.File
+import java.util.UUID
+
+/** 3.0 AI 工具箱：功能方块网格（每两格一行）。加新功能 = 在 tools 列表里加一项，需要独立页的再在 when(open) 里接上。 */
+private data class Tool(val id: String, val icon: ImageVector, val title: String, val sub: String)
+
+@Composable
+fun ToolboxPage(chat: ChatViewModel, onBack: () -> Unit, onOpenImageGen: () -> Unit) {
+    val ctx = LocalContext.current
+    var open by rememberSaveable { mutableStateOf<String?>(null) }
+    androidx.activity.compose.BackHandler(open != null) { open = null }
+    val floating by FloatingService.running.collectAsStateWithLifecycle()
+    when (open) {
+        "music" -> SubpageScaffold("MusicGen", { open = null }) { ScrollBody { MusicGenSection() } }
+        "video" -> SubpageScaffold("影片生成", { open = null }) { ScrollBody { VideoStudioPage() } }
+        "tts" -> SubpageScaffold(I18n.s(R.string.v30_tb_tts), { open = null }) { ScrollBody { TtsSection(chat) } }
+        "stt" -> SubpageScaffold(I18n.s(R.string.v30_tb_stt), { open = null }) { ScrollBody { SttSection(chat) } }
+        "find" -> SubpageScaffold(I18n.s(R.string.v30_tb_find), { open = null }) { ScrollBody { FindSection() } }
+        "float" -> SubpageScaffold(I18n.s(R.string.v30_floating), { open = null }) { ScrollBody { FloatSection(chat, floating) } }
+        else -> {
+            val tools = listOf(
+                Tool("image", IrisIcons.Image, I18n.s(R.string.v30_w_image), I18n.s(R.string.v30_tb_image_sub)),
+                Tool("music", IrisIcons.Sound, "MusicGen", I18n.s(R.string.v2_mg_tool_sub)),
+                Tool("video", IrisIcons.Image, "影片生成", "匯入 SVD-XT ONNX 模型並從圖片生成影片"),
+                Tool("float", IrisIcons.Layers, I18n.s(R.string.v30_floating), if (floating) I18n.s(R.string.v30_tb_on) else I18n.s(R.string.v30_tb_float_sub2)),
+                Tool("tts", IrisIcons.Sound, I18n.s(R.string.v30_tb_tts), I18n.s(R.string.v30_tb_tts_sub)),
+                Tool("stt", IrisIcons.Chat, I18n.s(R.string.v30_tb_stt), I18n.s(R.string.v30_tb_stt_sub)),
+                Tool("find", IrisIcons.Search, I18n.s(R.string.v30_tb_find), I18n.s(R.string.v30_tb_find_sub)),
+            )
+            fun tap(id: String) = when (id) {
+                "image" -> onOpenImageGen()
+                "music", "video" -> { open = id }
+                else -> { open = id }
+            }
+            SubpageScaffold(I18n.s(R.string.v30_toolbox), onBack) {
+                ScrollBody {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = IrisDimens.groupGutter), verticalArrangement = Arrangement.spacedBy(IrisDimens.space12)) {
+                        tools.chunked(2).forEach { row ->
+                            Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(IrisDimens.space12)) {
+                                row.forEach { t -> ToolTile(t.icon, t.title, t.sub, Modifier.weight(1f).fillMaxHeight()) { tap(t.id) } }
+                                if (row.size == 1) Spacer(Modifier.weight(1f))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MusicGenSection() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var bundles by remember { mutableStateOf<List<OnnxBundle>>(emptyList()) }
+    var legacyModels by remember { mutableStateOf<List<ImportedMusicModel>>(emptyList()) }
+    var selectedId by rememberSaveable { mutableStateOf<String?>(null) }
+    var prompt by rememberSaveable { mutableStateOf("") }
+    var duration by rememberSaveable { mutableFloatStateOf(5f) }
+    var output by remember { mutableStateOf<File?>(null) }
+    var player by remember { mutableStateOf<MediaPlayer?>(null) }
+    var playerReady by remember { mutableStateOf(false) }
+    var playing by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    suspend fun reload() {
+        val loaded = withContext(Dispatchers.IO) { OnnxBundleLibrary.list(context.filesDir) }
+        bundles = loaded
+        legacyModels = withContext(Dispatchers.IO) { MusicModelLibrary.list(context.filesDir) }
+        val supported = loaded.filter { bundle ->
+            val names = bundle.assets.map { it.path.substringAfterLast('/') }.toSet()
+            setOf("config.json", "tokenizer.json", "text_encoder.onnx", "decoder_model_merged.onnx", "encodec_decode.onnx")
+                .all { it in names }
+        }
+        if (selectedId !in supported.map { it.id }) selectedId = supported.firstOrNull()?.id
+    }
+
+    LaunchedEffect(context.filesDir) {
+        try {
+            reload()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            error = e.localizedMessage ?: e.javaClass.simpleName
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            player?.release()
+            player = null
+        }
+    }
+
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) scope.launch {
+            busy = true
+            error = null
+            try {
+                withContext(Dispatchers.IO) { OnnxBundleLibrary.importTree(context, uri) }
+                reload()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                error = e.localizedMessage ?: e.javaClass.simpleName
+            } finally {
+                busy = false
+            }
+        }
+    }
+    val legacyPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) scope.launch {
+            busy = true
+            error = null
+            try {
+                withContext(Dispatchers.IO) {
+                    val resolver = context.contentResolver
+                    val sources = uris.distinct().map { uri ->
+                        val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                            if (cursor.moveToFirst()) cursor.getString(0) else null
+                        } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "model.gguf"
+                        MusicModelSource(name) {
+                            resolver.openInputStream(uri) ?: throw IOException("Unable to read selected file: $name")
+                        }
+                    }
+                    MusicModelLibrary.import(context.filesDir, sources)
+                }
+                reload()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                error = e.localizedMessage ?: e.javaClass.simpleName
+            } finally {
+                busy = false
+                            }
+        }
+    }
+
+    val musicBundles = bundles.filter { bundle ->
+        val names = bundle.assets.map { it.path.substringAfterLast('/') }.toSet()
+        setOf("config.json", "tokenizer.json", "text_encoder.onnx", "decoder_model_merged.onnx", "encodec_decode.onnx")
+            .all { it in names }
+    }
+    val selected = musicBundles.firstOrNull { it.id == selectedId }
+    SectionTitle("MusicGen ONNX")
+    SettingsGroup {
+        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
+            Text(
+                "選取包含 config.json、tokenizer.json、text_encoder.onnx、decoder_model_merged.onnx 與 encodec_decode.onnx 的模型資料夾。",
+                style = IrisType.secondary,
+                color = Iris.colors.textSecondary,
+            )
+            Spacer(Modifier.height(IrisDimens.space8))
+            Text("模型只複製到本機 App 儲存空間，不會打包進 APK。", style = IrisType.caption, color = Iris.colors.textTertiary)
+            Spacer(Modifier.height(IrisDimens.space12))
+            IrisButton(
+                "匯入 ONNX 模型資料夾",
+                onClick = { picker.launch(null) },
+                enabled = !busy,
+                compact = true,
+                style = IrisButtonStyle.Tonal,
+                icon = IrisIcons.File,
+            )
+        }
+    }
+
+    if (busy) Text("正在準備模型或生成音訊…", style = IrisType.caption, color = Iris.colors.textSecondary)
+    if (musicBundles.isEmpty() && !busy) Text(
+        "尚未匯入完整的 MusicGen ONNX 模型資料夾。",
+        style = IrisType.secondary,
+        color = Iris.colors.textTertiary,
+        modifier = Modifier.padding(horizontal = IrisDimens.rowPadding, vertical = IrisDimens.space12),
+    )
+    SectionTitle("既有 GGUF／Safetensors／MNN 素材")
+    SettingsGroup {
+        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
+            Text("此區僅保留素材管理；MusicGen 推論需使用上方相容的 ONNX bundle。", style = IrisType.caption, color = Iris.colors.textTertiary)
+            IrisButton(
+                "匯入既有模型檔",
+                onClick = { legacyPicker.launch(arrayOf("*/*")) },
+                enabled = !busy,
+                compact = true,
+                style = IrisButtonStyle.Tonal,
+            )
+        }
+    }
+    legacyModels.forEach { model ->
+        SettingsGroup {
+            Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
+                Text(model.name, style = IrisType.label, color = Iris.colors.text)
+                Text("${model.assets.size} 個素材檔案", style = IrisType.caption, color = Iris.colors.textSecondary)
+                IrisButton(
+                    "刪除素材",
+                    onClick = {
+                        scope.launch {
+                            try {
+                                withContext(Dispatchers.IO) { MusicModelLibrary.delete(context.filesDir, model.id) }
+                                reload()
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                error = e.localizedMessage ?: e.javaClass.simpleName
+                            }
+                        }
+                    },
+                    compact = true,
+                    style = IrisButtonStyle.Text,
+                    destructive = true,
+                )
+            }
+        }
+    }
+    musicBundles.forEach { bundle ->
+        SettingsGroup(Modifier.clickable { selectedId = bundle.id }) {
+            Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
+                Text(bundle.name, style = IrisType.label, color = Iris.colors.text)
+                Text("${bundle.assets.size} 個模型檔案", style = IrisType.caption, color = Iris.colors.textSecondary)
+                Text(
+                    bundle.assets.map { it.path.substringAfterLast('/') }.take(5).joinToString("、"),
+                    style = IrisType.caption,
+                    color = Iris.colors.textTertiary,
+                    maxLines = 2,
+                )
+                if (selectedId == bundle.id) Text("已選取", style = IrisType.caption, color = Iris.colors.accent)
+                IrisButton(
+                    "刪除模型",
+                    onClick = {
+                        scope.launch {
+                            try {
+                                withContext(Dispatchers.IO) { OnnxBundleLibrary.delete(context.filesDir, bundle.id) }
+                                reload()
+                                error = null
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                error = e.localizedMessage ?: e.javaClass.simpleName
+                            }
+                        }
+                    },
+                    compact = true,
+                    style = IrisButtonStyle.Text,
+                    destructive = true,
+                )
+            }
+        }
+    }
+    selected?.let { bundle ->
+        SectionTitle("文字生成音樂")
+        SettingsGroup {
+            Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
+                OutlinedTextField(
+                    value = prompt,
+                    onValueChange = { prompt = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("音樂描述") },
+                    placeholder = { Text("例如：柔和鋼琴與弦樂，平靜電影配樂") },
+                    minLines = 2,
+                    maxLines = 4,
+                    colors = irisTextFieldColors(),
+                    textStyle = IrisType.body.copy(color = Iris.colors.text),
+                )
+                Spacer(Modifier.height(IrisDimens.space8))
+                SliderRow("長度", duration, 1f..20f, "${duration.toInt()} 秒", steps = 18) { duration = it }
+                IrisButton(
+                    if (busy) "正在生成…" else "生成 WAV",
+                    onClick = {
+                        scope.launch {
+                            busy = true
+                            error = null
+                            try {
+                                player?.release()
+                                player = null
+                                playerReady = false
+                                playing = false
+                                output = withContext(Dispatchers.IO) {
+                                    val file = File(context.filesDir, "musicgen/${UUID.randomUUID()}.wav")
+                                    MusicGenOnnxEngine.generate(context.filesDir, bundle, prompt, file, duration.toInt()).wav
+                                }
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                error = e.localizedMessage ?: e.javaClass.simpleName
+                            } finally {
+                                busy = false
+                            }
+                        }
+                    },
+                    enabled = !busy && prompt.isNotBlank(),
+                    compact = true,
+                    style = IrisButtonStyle.Primary,
+                    icon = IrisIcons.Sound,
+                )
+            }
+        }
+    }
+    output?.let { wav ->
+        SettingsGroup {
+            Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
+                Text("生成檔案：${wav.name}", style = IrisType.label, color = Iris.colors.text)
+                IrisButton(
+                    when {
+                        playing -> "暫停試聽"
+                        player != null && !playerReady -> "載入音訊…"
+                        else -> "播放 WAV"
+                    },
+                    onClick = {
+                        try {
+                            val current = player
+                            if (current?.isPlaying == true) {
+                                current.pause()
+                                playing = false
+                            } else if (current != null) {
+                                if (playerReady) {
+                                    current.seekTo(0)
+                                    current.start()
+                                    playing = true
+                                }
+                            } else {
+                                val next = MediaPlayer()
+                                next.setOnErrorListener { failed, what, extra ->
+                                    failed.release()
+                                    if (player === failed) player = null
+                                    playerReady = false
+                                    playing = false
+                                    error = "WAV 播放失敗（$what/$extra）"
+                                    true
+                                }
+                                next.setOnCompletionListener { playing = false }
+                                next.setOnPreparedListener {
+                                    playerReady = true
+                                    it.start()
+                                    playing = true
+                                }
+                                next.setDataSource(wav.absolutePath)
+                                next.prepareAsync()
+                                player = next
+                            }
+                        } catch (e: Exception) {
+                            error = e.localizedMessage ?: e.javaClass.simpleName
+                        }
+                    },
+                    enabled = player == null || playerReady || playing,
+                    compact = true,
+                    style = IrisButtonStyle.Tonal,
+                    icon = IrisIcons.Sound,
+                )
+            }
+        }
+    }
+    error?.let { Text("錯誤：$it", style = IrisType.caption, color = Iris.colors.warning) }
+    Spacer(Modifier.height(IrisDimens.space12))
+}
+
+/** Beta3：悬浮窗设置页（工具箱里点进来，不再一点就开）。 */
+@Composable
+private fun FloatSection(chat: ChatViewModel, running: Boolean) {
+    val ctx = LocalContext.current
+    val st = chat.settings.collectAsStateWithLifecycle().value
+    // 从系统授权页回来时重新读权限
+    var tick by remember { mutableStateOf(0) }
+    val owner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(owner) {
+        val o = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) tick++ }
+        owner.lifecycle.addObserver(o); onDispose { owner.lifecycle.removeObserver(o) }
+    }
+    val canDraw = remember(tick) { FloatingService.canDraw(ctx) }
+    val a11y = remember(tick) { com.iris.localai.agent.gui.android.IrisAccessibilityService.connected }
+    Spacer(Modifier.height(IrisDimens.space8))
+    SettingsGroup {
+        SwitchRow(I18n.s(R.string.v31_fl_set_on), running, subtitle = if (canDraw) null else I18n.s(R.string.v31_fl_perm), icon = IrisIcons.Layers) { on ->
+            when {
+                !on -> FloatingService.stop(ctx)
+                !FloatingService.canDraw(ctx) -> runCatching { ctx.startActivity(FloatingService.permissionIntent(ctx)) }
+                else -> FloatingService.start(ctx)
+            }
+        }
+        SwitchRow(I18n.s(R.string.v31_fl_set_peek), st.floatPeek) { on -> chat.updateSettings { it.copy(floatPeek = on) } }
+        SliderRow(I18n.s(R.string.v31_fl_set_size), st.floatSize.toFloat(), 40f..64f, "${st.floatSize} dp", steps = 5) { v -> chat.updateSettings { it.copy(floatSize = v.toInt()) } }
+    }
+    SectionTitle(I18n.s(R.string.v31_fl_set_menu))
+    SettingsGroup {
+        val names = mapOf(
+            com.iris.localai.floating.FloatingLogic.Mode.TRANSLATE to I18n.s(R.string.v31_fl_tr_screen),
+            com.iris.localai.floating.FloatingLogic.Mode.SCREEN to I18n.s(R.string.v30_fl_screen),
+            com.iris.localai.floating.FloatingLogic.Mode.ASK to I18n.s(R.string.v30_fl_ask),
+        )
+        com.iris.localai.floating.FloatingLogic.MENU.forEach { m ->
+            SwitchRow(names.getValue(m), m.name in st.floatItems) { on ->
+                chat.updateSettings { it.copy(floatItems = if (on) it.floatItems + m.name else it.floatItems - m.name) }
+            }
+        }
+    }
+    if (!a11y) {
+        Spacer(Modifier.height(IrisDimens.space12))
+        SettingsGroup {
+            SettingsRow(I18n.s(R.string.v31_fl_a11y), onClick = {
+                runCatching { ctx.startActivity(android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            })
+        }
+    }
+}
+
+@Composable
+private fun ToolTile(icon: ImageVector, title: String, sub: String, modifier: Modifier, onClick: () -> Unit) {
+    val c = Iris.colors
+    IrisCard(modifier.clickable(onClick = onClick)) {
+        Column(Modifier.fillMaxWidth().padding(IrisDimens.space16)) {
+            Box(Modifier.size(40.dp).background(c.accent.copy(alpha = 0.12f), IrisRadius.mediumShape), contentAlignment = Alignment.Center) {
+                Icon(icon, null, tint = c.accent, modifier = Modifier.size(22.dp))
+            }
+            Spacer(Modifier.height(IrisDimens.space12))
+            Text(title, style = IrisType.label, color = c.text)
+            Text(sub, style = IrisType.caption, color = c.textSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+    }
+}
+
+@Composable
+private fun TtsSection(chat: ChatViewModel) {
+    val c = Iris.colors
+    var text by rememberSaveable { mutableStateOf("") }
+    val speaking by chat.speakingMessageId.collectAsStateWithLifecycle()
+    SectionTitle(I18n.s(R.string.v30_tb_tts))
+    SettingsGroup {
+        Column(Modifier.padding(IrisDimens.space16)) {
+            OutlinedTextField(
+                text, { text = it }, colors = irisTextFieldColors(), textStyle = IrisType.body.copy(color = c.text),
+                placeholder = { Text(I18n.s(R.string.v30_tb_tts_hint), color = c.textTertiary) },
+                modifier = Modifier.fillMaxWidth().heightIn(min = 96.dp, max = 220.dp),
+            )
+            Spacer(Modifier.height(IrisDimens.space12))
+            Row(horizontalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
+                if (speaking == TB_SPEAK_ID) IrisButton(I18n.s(R.string.v30_island_stop), { chat.stopSpeaking() }, compact = true, style = IrisButtonStyle.Tonal)
+                else IrisButton(I18n.s(R.string.v30_tb_speak), { chat.speakText(text, TB_SPEAK_ID) }, compact = true, enabled = text.isNotBlank(), icon = IrisIcons.Sound)
+            }
+        }
+    }
+}
+
+private const val TB_SPEAK_ID = "toolbox-tts"
+
+@Composable
+private fun SttSection(chat: ChatViewModel) {
+    val c = Iris.colors
+    val clipboard = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
+    val haptic = rememberIrisFeedback()
+    var result by rememberSaveable { mutableStateOf("") }
+    var holding by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    val st = chat.settings.collectAsStateWithLifecycle().value
+    val lang = st.asrLanguage
+    // 3.0.0：第一次在工具箱里用语音转文本时先申请麦克风权限（以前直接 start，没权限就什么都不发生）
+    val ctx = LocalContext.current
+    var micDenied by remember { mutableStateOf(false) }
+    val micLauncher = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { ok -> micDenied = !ok }
+    // Beta2：可选识别模型——列出已装的语音识别包，点选即设为当前（与 模型 页 的选择同一设置）
+    val packStates by chat.voiceStore.states.collectAsStateWithLifecycle()
+    val asrPacks = remember(packStates) {
+        com.iris.localai.voice.VoicePack.entries.filter { it.kind == com.iris.localai.voice.VoiceKind.ASR && packStates[it] == com.iris.localai.voice.PackState.Installed }
+    }
+    val activeAsr = remember(packStates, st.asrPack) { chat.voiceStore.active(com.iris.localai.voice.VoiceKind.ASR, st.asrPack) }
+    SectionTitle(I18n.s(R.string.v30_tb_stt))
+    SettingsGroup {
+        Column(Modifier.padding(IrisDimens.space16)) {
+            Text(I18n.s(R.string.v30b2_stt_model), style = IrisType.caption, color = c.textSecondary)
+            Spacer(Modifier.height(IrisDimens.space8))
+            if (asrPacks.isEmpty()) Text(I18n.s(R.string.v30b2_stt_none), style = IrisType.body, color = c.textTertiary)
+            else Row(Modifier.horizontalScroll(androidx.compose.foundation.rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
+                asrPacks.forEach { p ->
+                    val sel = p == activeAsr
+                    Box(
+                        Modifier.clip(IrisRadius.pillShape)
+                            .background(com.iris.localai.ui.motion.selectTint(if (sel) c.accentContainer else c.surfaceVariant))
+                            .clickable(enabled = !holding && !busy) { chat.useAsrPack(p.id) }
+                            .padding(horizontal = IrisDimens.space12, vertical = IrisDimens.space6),
+                    ) { Text(p.title, style = IrisType.labelSmall, color = com.iris.localai.ui.motion.selectTint(if (sel) c.onAccentContainer else c.textSecondary)) }
+                }
+            }
+            Spacer(Modifier.height(IrisDimens.space12))
+            Box(
+                Modifier.fillMaxWidth().height(52.dp)
+                    .background(com.iris.localai.ui.motion.selectTint(if (holding) c.accent else c.surfaceVariant, "pttBg"), IrisRadius.pillShape)
+                    .pointerInput(lang) {
+                        detectTapGestures(onPress = {
+                            if (busy) return@detectTapGestures
+                            if (ctx.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                micLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+                                return@detectTapGestures
+                            }
+                            micDenied = false
+                            holding = true; haptic.perform(FeedbackEvent.LISTEN_START)
+                            chat.dictation.warmLanguage = lang
+                            chat.dictation.start()
+                            tryAwaitRelease()
+                            holding = false; haptic.perform(FeedbackEvent.LISTEN_STOP)
+                            busy = true
+                            scope.launch {
+                                val t = runCatching { chat.dictation.finish(lang) }.getOrDefault("")
+                                result = com.iris.localai.voice.DictationText.join(result, t)
+                                busy = false
+                            }
+                        })
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                val reduce = LocalReduceMotion.current
+                val fg = com.iris.localai.ui.motion.selectTint(if (holding) c.onAccent else c.text, "pttFg")
+                AnimatedContent(
+                    when { holding -> I18n.s(R.string.v30_ptt_release); busy -> I18n.s(R.string.v30_tb_recognizing); else -> I18n.s(R.string.v30_ptt_hold) },
+                    transitionSpec = { motion(reduce) { IrisMotion.crossfade() } }, label = "ptt",
+                ) { t -> Text(t, style = IrisType.label, color = fg) }
+            }
+            if (micDenied) {
+                Spacer(Modifier.height(IrisDimens.space8))
+                Text(I18n.s(R.string.b30_mic_denied), style = IrisType.caption, color = c.danger)
+            }
+            // 清空时收起，退场期间仍显示最后一段
+            val shownResult = rememberLast(result.ifBlank { null }).orEmpty()
+            Fold(result.isNotBlank()) {
+                Column {
+                    Spacer(Modifier.height(IrisDimens.space12))
+                    SelectionContainer { Text(shownResult, style = IrisType.body, color = c.text) }
+                    Row(Modifier.padding(top = IrisDimens.space8), horizontalArrangement = Arrangement.spacedBy(IrisDimens.space8)) {
+                        IrisButton(I18n.s(R.string.v30_fl_copy), { clipboard.setText(AnnotatedString(shownResult)) }, compact = true, style = IrisButtonStyle.Tonal, icon = IrisIcons.Copy)
+                        IrisButton(I18n.s(R.string.v30_tb_to_chat), { chat.setDraft(shownResult) }, compact = true, style = IrisButtonStyle.Tonal, icon = IrisIcons.Chat)
+                        IrisButton(I18n.s(R.string.v30_tb_clear), { result = "" }, compact = true, style = IrisButtonStyle.Text)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FindSection() {
+    val c = Iris.colors
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var q by rememberSaveable { mutableStateOf("") }
+    var hits by remember { mutableStateOf<List<FileFinder.Hit>>(emptyList()) }
+    var searching by remember { mutableStateOf(false) }
+    var searched by remember { mutableStateOf(false) }
+    val owner = LocalLifecycleOwner.current
+    // 从系统「全部文件访问」页回来时重新读权限
+    var access by remember { mutableStateOf(FileFinder.hasAccess()) }
+    DisposableEffect(owner) {
+        val o = LifecycleEventObserver { _, e ->
+            if (e == Lifecycle.Event.ON_STOP) FileFinder.release()
+            if (e == Lifecycle.Event.ON_RESUME) access = FileFinder.hasAccess()
+        }
+        owner.lifecycle.addObserver(o)
+        onDispose { owner.lifecycle.removeObserver(o); FileFinder.release() }
+    }
+    SectionTitle(I18n.s(R.string.v30_tb_find))
+    if (!access) {
+        SettingsGroup {
+            Column(Modifier.padding(IrisDimens.space16)) {
+                Text(I18n.s(R.string.b30_find_perm), style = IrisType.body, color = c.text)
+                Spacer(Modifier.height(IrisDimens.space8))
+                IrisButton(I18n.s(R.string.b30_find_perm_go), { com.iris.localai.ui.models.openAllFilesAccess(ctx) }, compact = true, icon = IrisIcons.Folder)
+            }
+        }
+        Spacer(Modifier.height(IrisDimens.space12))
+    }
+    SettingsGroup {
+        Column(Modifier.padding(IrisDimens.space16)) {
+            Text(
+                if (FileFinder.semanticAvailable()) I18n.s(R.string.v30_tb_find_sem) else I18n.s(R.string.v30_tb_find_kw),
+                style = IrisType.caption, color = c.textSecondary,
+            )
+            Spacer(Modifier.height(IrisDimens.space8))
+            OutlinedTextField(
+                q, { q = it }, singleLine = true, colors = irisTextFieldColors(), textStyle = IrisType.body.copy(color = c.text),
+                placeholder = { Text(I18n.s(R.string.v30_tb_find_hint), color = c.textTertiary) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(IrisDimens.space8))
+            IrisButton(
+                if (searching) I18n.s(R.string.v30_tb_searching) else I18n.s(R.string.v30_fl_search),
+                { searching = true; scope.launch { hits = runCatching { FileFinder.search(q) }.getOrDefault(emptyList()); searching = false; searched = true } },
+                compact = true, enabled = q.isNotBlank() && !searching, icon = IrisIcons.Search,
+            )
+        }
+        if (searched && hits.isEmpty()) SettingsRow(I18n.s(R.string.v30_fl_nothing))
+        hits.take(20).forEach { h ->
+            SettingsRow(
+                h.file.name, subtitle = h.file.parent.orEmpty().substringAfter("/0/"), subtitleMaxLines = 1,
+                icon = if (FindScore.kindWords(h.file.extension).startsWith("照片")) IrisIcons.Image else IrisIcons.File,
+                onClick = { openFile(ctx, h.file) },
+            )
+        }
+    }
+}
+
+private fun openFile(ctx: android.content.Context, f: File) {
+    runCatching {
+        val uri: Uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)
+        val type = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "*/*"
+        ctx.startActivity(Intent.createChooser(Intent(Intent.ACTION_VIEW).setDataAndType(uri, type).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), f.name).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+}

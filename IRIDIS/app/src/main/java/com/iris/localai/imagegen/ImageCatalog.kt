@@ -1,0 +1,352 @@
+package com.iris.localai.imagegen
+
+enum class Tier { LOW, MID, HIGH }
+/** SDCPP = upstream stable-diffusion.cpp on the GPU (ggml Vulkan) with CPU fallback. */
+enum class Backend { QNN, MNN_CPU, SDCPP }
+
+/** A file inside a downloaded archive, after flattening its top-level folder; [path] is relative to the model folder. */
+data class UnpackedFile(val path: String, val size: Long)
+
+/**
+ * One download. [path] is relative to the imagegen models root (`<model id>/…`). A Hugging Face url
+ * (`https://huggingface.co/…`) is fetched from the chosen [com.iris.localai.data.DownloadSource] host.
+ * An archive ([unpacked] non-empty) is extracted into the model folder and deleted afterwards.
+ */
+data class RemoteFile(
+    val url: String,
+    val size: Long,
+    val path: String,
+    val unpacked: List<UnpackedFile> = emptyList(),
+    /**
+     * ≥ 0 = [size] bytes starting here are ONE zip entry (local header + compressed data) cut out of the
+     * remote zip at [url] with an HTTP Range request; it is inflated into [unpacked]`[0]` (checked against [crc]).
+     * Lets a model take only the files it needs from a bigger archive.
+     */
+    val zipEntryAt: Long = -1L,
+    val crc: Long = -1L,
+) {
+    val isArchive: Boolean get() = unpacked.isNotEmpty()
+    val isZipSlice: Boolean get() = zipEntryAt >= 0
+    /** The url with the slice range as a `#bytes=a-b` fragment (HttpDownload turns it into a Range header). */
+    val fetchUrl: String get() = if (isZipSlice) "$url#bytes=$zipEntryAt-${zipEntryAt + size - 1}" else url
+}
+
+data class ImageModel(
+    val id: String,
+    val tier: Tier,
+    val name: String,
+    val backend: Backend,
+    val files: List<RemoteFile>,
+    val fixedSize: Int?,
+    val defaultSteps: Int,
+    val defaultCfg: Float,
+    /** HF repo the files come from (informational; when [files] is empty its file list would be resolved at download time). */
+    val hfRepo: String? = null,
+    /** prompt / negative put into empty (or still-default) fields when this model is picked. */
+    val defaultPrompt: String = "",
+    val defaultNegative: String = "",
+    /**
+     * QNN graph conventions. AI Hub's VAE divides by 0.18215 itself and returns [0,1];
+     * Local Dream's expects latent / 0.18215 and returns [-1,1] (NCHW, detected from the tensor shape).
+     */
+    val vaeInScale: Float = 1f,
+    val vaeOutSigned: Boolean = false,
+    /** Lowest Hexagon HTP arch the model's context binaries run on. */
+    val minHtpArch: Int = 73,
+    /** One line under the name on the 生图 page (empty = none). */
+    val note: String = "",
+    /** [Backend.SDCPP] models — which downloaded file is the diffusion model, text encoder and VAE. */
+    val sdFiles: SdFiles? = null,
+    /** runs on the Hexagon NPU through libiris_sdq.so (sd.cpp Qualcomm branch, HTP v79+), FP8 DiT. */
+    val sdq: Boolean = false,
+    /** Danbooru 标签风格的模型（Anima / Anything）：提示词扩写与标签库用逗号标签写法。 */
+    val tagStyle: Boolean = false,
+    /** 非 Apache/MIT 许可的模型：卡片上的一行摘要 + 原文链接，首次下载前要用户确认。 */
+    val licenseNote: String = "",
+    val licenseUrl: String = "",
+    /** 用户导入的模型（[ImportedImages]），可改名，删除时连清单一起删。 */
+    val imported: Boolean = false,
+    /** 导入的 Anima NPU 包（QNN context binary，[AnimaQnnEngine]）。 */
+    val animaQnn: Boolean = false,
+    /** Anima NPU：流匹配调度偏移（每个导入模型单独存，[ImportedImage.shift]）。 */
+    val animaShift: Float = AnimaMath.DEFAULT_SHIFT,
+) {
+    /** Files under [ImageCatalog.SHARED_DIR] other models may use too (kept when this one is deleted). */
+    val sharedPaths: List<String> get() = files.map { it.path }.filter { it.startsWith(ImageCatalog.SHARED_DIR + "/") }
+}
+
+object ImageCatalog {
+    /** taobao-mnn/stable-diffusion-v1-5-mnn-general, pinned to the revision checked 2026-10-22. */
+    const val MNN_REPO = "taobao-mnn/stable-diffusion-v1-5-mnn-general"
+    const val MNN_REV = "56c93a62ac9d6b5d18605632b85e25f87281f317"
+    private fun mnnUrl(file: String) = "https://huggingface.co/$MNN_REPO/resolve/$MNN_REV/$file"
+
+    /** CLIP BPE tokenizer (SD 1.5 text encoder = CLIP ViT-L/14), from the MNN repo. */
+    private fun tokenizerFiles(modelId: String, sub: String) = listOf(
+        RemoteFile(mnnUrl("vocab.json"), 1_059_962L, "$modelId/${sub}vocab.json"),
+        RemoteFile(mnnUrl("merges.txt"), 524_619L, "$modelId/${sub}merges.txt"),
+    )
+
+    /**
+     * AI Hub SD1.5 w8a16 for this chip. 2.5.0-beta8: 8 Elite Gen 5 (HTP v81) takes AI Hub's own
+     * snapdragon_8_elite_gen5_for_galaxy zip (central directory read 2026-11-10); every other chip keeps the
+     * 8 Elite one. Not yet checked on a real 8 Elite Gen 5.
+     */
+    fun sd15Qnn(htpArch: Int?): ImageModel {
+        val gen5 = htpArch == 81
+        return ImageModel(
+            id = "sd15-qnn", tier = Tier.LOW, name = "Stable Diffusion 1.5 (NPU)", backend = Backend.QNN,
+            files = tokenizerFiles("sd15-qnn", "tokenizer/") + RemoteFile(
+                url = if (gen5) "${AIHUB_SD15}snapdragon_8_elite_gen5_for_galaxy.zip" else "${AIHUB_SD15}snapdragon_8_elite_for_galaxy.zip",
+                size = if (gen5) 710_771_252L else 709_785_222L,
+                path = "sd15-qnn/.part/stable_diffusion_v1_5-qnn_context_binary-w8a16.zip",
+                // zip central directory read 2026-10-22 / 2026-11-10 (one top-level folder, flattened away)
+                unpacked = if (gen5) listOf(
+                    UnpackedFile("text_encoder.bin", 163_087_248L),
+                    UnpackedFile("unet.bin", 882_544_432L),
+                    UnpackedFile("vae.bin", 60_837_728L),
+                    UnpackedFile("metadata.json", 4_149L),
+                ) else listOf(
+                    UnpackedFile("text_encoder.bin", 163_058_576L),
+                    UnpackedFile("unet.bin", 880_144_176L),
+                    UnpackedFile("vae.bin", 60_452_704L),
+                    UnpackedFile("metadata.json", 4_134L),
+                ),
+            ),
+            fixedSize = 512, defaultSteps = 20, defaultCfg = 7.5f,
+        )
+    }
+
+    /** For this phone's chip (unknown chip → the 8 Elite zip). */
+    val SD15_QNN: ImageModel by lazy { sd15Qnn(runCatching { DeviceProbe.htpArch(DeviceProbe.socModel()) }.getOrNull()) }
+
+    /** Repo listing (api/models/…/tree/main) checked 2026-10-22; .gitattributes / README.md left out. */
+    val SD15_MNN = ImageModel(
+        id = SD15_MNN_ID, tier = Tier.LOW, name = "Stable Diffusion 1.5 (CPU)", backend = Backend.MNN_CPU,
+        files = listOf(
+            "alphas.txt" to 6_999L,
+            "merges.txt" to 524_619L,
+            "text_encoder.mnn" to 249_944L,
+            "text_encoder.mnn.weight" to 238_120_368L,
+            "unet.mnn" to 1_353_144L,
+            "unet.mnn.weight" to 863_650_252L,
+            "vae_decoder.mnn" to 183_960L,
+            "vae_decoder.mnn.weight" to 49_639_636L,
+            "vocab.json" to 1_059_962L,
+        ).map { (f, size) -> RemoteFile(mnnUrl(f), size, "$SD15_MNN_ID/$f") },
+        fixedSize = 512, defaultSteps = 20, defaultCfg = 7.5f,
+        hfRepo = MNN_REPO,
+    )
+
+    /** Qualcomm AI Hub SD1.5 release v0.64.0 (w8a16 QNN context binaries), per-SoC zips. */
+    private const val AIHUB_SD15 = "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/stable_diffusion_v1_5/releases/v0.64.0/stable_diffusion_v1_5-qnn_context_binary-w8a16-qualcomm_"
+
+    /** xororz/sd-qnn (Local Dream's NPU models), pinned to the revision checked 2026-11-01. */
+    const val LD_REPO = "xororz/sd-qnn"
+    const val LD_REV = "64d16039e0c3a71d3c5db1faccc090faae93cb28"
+
+    const val ANYTHING_V5_ID = "anything-v5-qnn"
+    const val ANYTHING_PROMPT = "masterpiece, best quality, 1girl, solo, cute, white hair,"
+    const val ANYTHING_NEGATIVE = "lowres, bad anatomy, bad hands, missing fingers, extra fingers, bad arms, missing legs, missing arms, poorly drawn face, bad face, fused face, cloned face, three crus, fused feet, fused thigh, extra crus, ugly fingers, horn, realistic photo, huge eyes, worst face, 2girl, long fingers, disconnected limbs,"
+
+    /**
+     * Anything V5.0 (SD1.5 anime fine-tune, CreativeML OpenRAIL-M) as Local Dream ships it for the NPU
+     * (AnythingV5_qnn2.28_8gen2.zip: Local Dream uses this one zip for 8 Gen 2 … 8 Elite Gen 5). Only UNet and
+     * VAE decoder are taken from it (Range-sliced; its CLIP is an MNN CPU graph that libiris_imagegen cannot run).
+     * The text encoder is AI Hub's SD1.5 QNN one (CLIP ViT-L/14; Anything V5's text encoder is the SD1.5 one
+     * to ~1e-3, checked 2026-11-01), from the zip matching the chip: 8 Gen 3 (v75), 8 Elite Gen 5 (v81) or 8 Elite (v79 / unknown).
+     * Zip central directories / local headers read 2026-11-01.
+     */
+    fun anythingV5(htpArch: Int?): ImageModel {
+        val id = ANYTHING_V5_ID
+        val ld = "https://huggingface.co/$LD_REPO/resolve/$LD_REV/AnythingV5_qnn2.28_8gen2.zip"
+        val te = if (htpArch == 75)
+            RemoteFile("${AIHUB_SD15}snapdragon_8gen3.zip", 124_431_624L, "$id/.part/text_encoder.slice",
+                listOf(UnpackedFile("text_encoder.bin", 163_029_904L)), zipEntryAt = 585_291_399L, crc = 0x0ec6f127L)
+        else if (htpArch == 81) // 8 Elite Gen 5 (v81), local header read 2026-11-10
+            RemoteFile("${AIHUB_SD15}snapdragon_8_elite_gen5_for_galaxy.zip", 124_443_624L, "$id/.part/text_encoder.slice",
+                listOf(UnpackedFile("text_encoder.bin", 163_087_248L)), zipEntryAt = 586_326_016L, crc = 0x38d41ee9L)
+        else
+            RemoteFile("${AIHUB_SD15}snapdragon_8_elite_for_galaxy.zip", 124_432_784L, "$id/.part/text_encoder.slice",
+                listOf(UnpackedFile("text_encoder.bin", 163_058_576L)), zipEntryAt = 585_350_860L, crc = 0x5fd1471dL)
+        return ImageModel(
+            id = id, tier = Tier.LOW, name = "Anything V5.0（动漫）", backend = Backend.QNN,
+            files = tokenizerFiles(id, "tokenizer/") + te + listOf(
+                RemoteFile(ld, 684_921_044L, "$id/.part/unet.slice", listOf(UnpackedFile("unet.bin", 880_553_304L)),
+                    zipEntryAt = 290_997_738L, crc = 0x92c42f15L),
+                RemoteFile(ld, 45_827_921L, "$id/.part/vae.slice", listOf(UnpackedFile("vae.bin", 59_949_944L)),
+                    zipEntryAt = 245_169_817L, crc = 0x980945b8L),
+            ),
+            fixedSize = 512, defaultSteps = 20, defaultCfg = 7f,
+            hfRepo = LD_REPO,
+            defaultPrompt = ANYTHING_PROMPT, defaultNegative = ANYTHING_NEGATIVE,
+            vaeInScale = 1f / 0.18215f, vaeOutSigned = true, minHtpArch = 75, tagStyle = true,
+            note = "动漫风格 · 512×512 · NPU（骁龙 8 Gen 3 及以上）",
+        )
+    }
+
+    /** For this phone's chip (unknown chip → the 8 Elite text encoder). */
+    val ANYTHING_V5: ImageModel by lazy { anythingV5(runCatching { DeviceProbe.htpArch(DeviceProbe.socModel()) }.getOrNull()) }
+
+    /** files more than one model uses (the Qwen3-4B text encoder), relative to the imagegen root. */
+    const val SHARED_DIR = "_shared"
+
+    // sdq library sizes / SHA-256 (CI native-sdq.yml output, tag SDQ_TAG).
+    const val SDQ_JNI_SIZE = 55_852_080L
+    const val SDQ_JNI_SHA = "547c7f18216abfb82fbed7abfedbd15a5d2aadfd7c1388c77b3a46eaf4469bde"
+    const val SDQ_V79_SIZE = 917_960L
+    const val SDQ_V79_SHA = "e431c6764a24b52d3b57584a6e8c76df5b1299625a5af79accf5735d726826be"
+    const val SDQ_V81_SIZE = 917_992L
+    const val SDQ_V81_SHA = "92939059061c4c51114f649fe2ed5d6388b9e28b6c5ee315ae1a8974cd09576f"
+
+    private fun hf(repo: String, rev: String, file: String) = "https://huggingface.co/$repo/resolve/$rev/$file"
+
+    /**
+     * libiris_sd.so (stable-diffusion.cpp 3e92bf9 + JNI; 2.7.0 adds nativeLoadEx, built by scripts/build-sd-native-arm64host.sh) is not in the APK; it is
+     * downloaded with the first sd.cpp model and only loaded after its SHA-256 matches [SD_LIB_SHA256] (SdNative).
+     */
+    const val SD_LIB_SHA256 = "31a97a5b81e9f4f62816ebaa5662a3df6a67b2344624e2b7600913f8b78e777a"
+    val SD_LIB = RemoteFile(
+        "https://raw.githubusercontent.com/WWRJ3321/IRIDIS/sdlib-3e92bf9-c/prebuilt-native/arm64-v8a/libiris_sd.so",
+        70_848_104L, "$SHARED_DIR/libiris_sd-3e92bf9-c.so",
+    )
+
+    /**
+     * Qwen3-4B Q4_K_M (unsloth/Qwen3-4B-GGUF, Apache-2.0): the text encoder of both FLUX.2 Klein 4B and
+     * Z-Image Turbo (Comfy-Org ships the same qwen_3_4b.safetensors, LFS oid 6c671498…, for both). Listing read 2026-11-05.
+     */
+    private val QWEN3_4B = RemoteFile(
+        hf("unsloth/Qwen3-4B-GGUF", "22c9fc8a8c7700b76a1789366280a6a5a1ad1120", "Qwen3-4B-Q4_K_M.gguf"),
+        2_497_281_312L, "$SHARED_DIR/Qwen3-4B-Q4_K_M.gguf",
+    )
+
+    /** FLUX.2 Klein 4B (Apache-2.0): leejet GGUF Q4_0 + FLUX.2 VAE (Comfy-Org/Flux-2-Klein-4B). 4 steps, CFG 1. */
+    val FLUX2_KLEIN = ImageModel(
+        id = "flux2-klein-4b", tier = Tier.MID, name = "FLUX.2 Klein 4B", backend = Backend.SDCPP,
+        files = listOf(
+            RemoteFile(hf("leejet/FLUX.2-klein-4B-GGUF", "3b1f5a9dc3abb32238b053aeb3d823c30afdacbd", "flux-2-klein-4b-Q4_0.gguf"),
+                2_460_378_560L, "flux2-klein-4b/flux-2-klein-4b-Q4_0.gguf"),
+            QWEN3_4B,
+            SD_LIB,
+            RemoteFile(hf("Comfy-Org/Flux-2-Klein-4B", "5b3abca5c0dc1ecd4eaf3340868d09063fc1c965", "split_files/vae/flux2-vae.safetensors"),
+                336_211_292L, "flux2-klein-4b/flux2-vae.safetensors"),
+        ),
+        fixedSize = null, defaultSteps = 4, defaultCfg = 1f,
+        hfRepo = "leejet/FLUX.2-klein-4B-GGUF",
+        note = "通用写实 · 4 步 · GPU（Vulkan），约 5.3 GB",
+        sdFiles = SdFiles("flux2-klein-4b/flux-2-klein-4b-Q4_0.gguf", QWEN3_4B.path, "flux2-klein-4b/flux2-vae.safetensors"),
+    )
+
+    /** Z-Image Turbo (Apache-2.0): leejet GGUF Q3_K + FLUX.1 VAE (Comfy-Org/Z-Image-Turbo). 8 steps, CFG 1; good with Chinese prompts and text. */
+    val Z_IMAGE_TURBO = ImageModel(
+        id = "z-image-turbo", tier = Tier.HIGH, name = "Z-Image Turbo", backend = Backend.SDCPP,
+        files = listOf(
+            RemoteFile(hf("leejet/Z-Image-Turbo-GGUF", "c61c0e422dc8b541b7548cf33a4ef8302b0f8085", "z_image_turbo-Q3_K.gguf"),
+                3_143_559_104L, "z-image-turbo/z_image_turbo-Q3_K.gguf"),
+            QWEN3_4B,
+            SD_LIB,
+            RemoteFile(hf("Comfy-Org/Z-Image-Turbo", "6fc90a3b1b653e935a0d175e260736de25b84df5", "split_files/vae/ae.safetensors"),
+                335_304_388L, "z-image-turbo/ae.safetensors"),
+        ),
+        fixedSize = null, defaultSteps = 8, defaultCfg = 1f,
+        hfRepo = "leejet/Z-Image-Turbo-GGUF",
+        note = "擅长中英文字 · 8 步 · GPU（Vulkan），约 6 GB",
+        sdFiles = SdFiles("z-image-turbo/z_image_turbo-Q3_K.gguf", QWEN3_4B.path, "z-image-turbo/ae.safetensors"),
+    )
+
+    /**
+     * Hexagon NPU image engine (scripts/build-sdq-native.sh, CI native-sdq.yml): stable-diffusion.cpp's
+     * Qualcomm branch (leejet/stable-diffusion.cpp PR #1970 by happyyzy, MIT) + JNI, with the HTP v79 / v81 skels.
+     * Downloaded with the NPU models from the GitHub tag [SDQ_TAG]; each file is loaded only when its SHA-256 matches.
+     */
+    const val SDQ_TAG = "sdqlib-854c9d1"
+    data class SdqLib(val name: String, val size: Long, val sha256: String) {
+        val file: RemoteFile get() = RemoteFile("https://raw.githubusercontent.com/WWRJ3321/IRIDIS/$SDQ_TAG/prebuilt-assets/sdq/$name", size, "$SHARED_DIR/sdq-854c9d1/$name")
+    }
+    val SDQ_LIBS: List<SdqLib> = listOf(
+        SdqLib("libiris_sdq.so", SDQ_JNI_SIZE, SDQ_JNI_SHA),
+        SdqLib("libirsd-htp-v79.so", SDQ_V79_SIZE, SDQ_V79_SHA),
+        SdqLib("libirsd-htp-v81.so", SDQ_V81_SIZE, SDQ_V81_SHA),
+    )
+
+    /** Qwen3-4B Q4_0 (unsloth/Qwen3-4B-GGUF): the HTP kernels take Q4_0 / Q8_0 / MXFP4, not Q4_K. */
+    private val QWEN3_4B_Q40 = RemoteFile(
+        hf("unsloth/Qwen3-4B-GGUF", "22c9fc8a8c7700b76a1789366280a6a5a1ad1120", "Qwen3-4B-Q4_0.gguf"),
+        2_375_773_472L, "$SHARED_DIR/Qwen3-4B-Q4_0.gguf",
+    )
+
+    /** Z-Image Turbo FP8 E4M3 DiT (Kijai/Z-Image_comfy_fp8_scaled, Apache-2.0) on the NPU; listing read 2026-11-06. */
+    val Z_IMAGE_NPU = ImageModel(
+        id = "z-image-turbo-npu", tier = Tier.HIGH, name = "Z-Image Turbo（NPU）", backend = Backend.SDCPP,
+        files = listOf(
+            RemoteFile(hf("Kijai/Z-Image_comfy_fp8_scaled", "952c72754beb38038a35c87a03a6da85d8232278", "z-image-turbo_fp8_scaled_e4m3fn_KJ.safetensors"),
+                6_158_115_074L, "z-image-turbo-npu/z-image-turbo_fp8_scaled_e4m3fn_KJ.safetensors"),
+            QWEN3_4B_Q40,
+            RemoteFile(hf("Comfy-Org/Z-Image-Turbo", "6fc90a3b1b653e935a0d175e260736de25b84df5", "split_files/vae/ae.safetensors"),
+                335_304_388L, "z-image-turbo-npu/ae.safetensors"),
+        ) + SDQ_LIBS.map { it.file },
+        fixedSize = null, defaultSteps = 8, defaultCfg = 1f,
+        hfRepo = "Kijai/Z-Image_comfy_fp8_scaled",
+        minHtpArch = 79,
+        note = "实验 · 擅长中英文字 · 8 步 · NPU（骁龙 8 Elite 及以上），约 8.9 GB",
+        sdFiles = SdFiles("z-image-turbo-npu/z-image-turbo_fp8_scaled_e4m3fn_KJ.safetensors", QWEN3_4B_Q40.path, "z-image-turbo-npu/ae.safetensors"),
+        sdq = true,
+    )
+
+    /** FLUX.2 Klein 4B FP8 (black-forest-labs/FLUX.2-klein-4b-fp8, Apache-2.0) on the NPU; listing read 2026-11-06. */
+    val FLUX2_KLEIN_NPU = ImageModel(
+        id = "flux2-klein-4b-npu", tier = Tier.MID, name = "FLUX.2 Klein 4B（NPU）", backend = Backend.SDCPP,
+        files = listOf(
+            RemoteFile(hf("black-forest-labs/FLUX.2-klein-4b-fp8", "5b4408e59397a4a37ccb46afe426d8ed86379441", "flux-2-klein-4b-fp8.safetensors"),
+                4_070_624_520L, "flux2-klein-4b-npu/flux-2-klein-4b-fp8.safetensors"),
+            QWEN3_4B_Q40,
+            RemoteFile(hf("Comfy-Org/Flux-2-Klein-4B", "5b3abca5c0dc1ecd4eaf3340868d09063fc1c965", "split_files/vae/flux2-vae.safetensors"),
+                336_211_292L, "flux2-klein-4b-npu/flux2-vae.safetensors"),
+        ) + SDQ_LIBS.map { it.file },
+        fixedSize = null, defaultSteps = 4, defaultCfg = 1f,
+        hfRepo = "black-forest-labs/FLUX.2-klein-4b-fp8",
+        minHtpArch = 79,
+        note = "实验 · 通用写实 · 4 步 · NPU（骁龙 8 Elite 及以上），约 6.8 GB",
+        sdFiles = SdFiles("flux2-klein-4b-npu/flux-2-klein-4b-fp8.safetensors", QWEN3_4B_Q40.path, "flux2-klein-4b-npu/flux2-vae.safetensors"),
+        sdq = true,
+    )
+
+    /**
+     * 内置 Anima Turbo 已移除（非商用许可，App 内提供下载会影响收捐助）。Anima 只能用户自己「导入模型」。
+     * 旧版下载过的目录 anima-turbo/ 留给存储页删除；导入预设仍可复用其中的文件。
+     */
+    const val ANIMA_OLD_ID = "anima-turbo"
+
+    /** Every model the app knows (downloaded ones are found by id even on another phone). */
+    val builtIn: List<ImageModel> = listOf(SD15_QNN, ANYTHING_V5, SD15_MNN, FLUX2_KLEIN, Z_IMAGE_TURBO, FLUX2_KLEIN_NPU, Z_IMAGE_NPU)
+
+    /**
+     * the NPU (sdq) models are listed only on HTP v79+ chips (8 Elite and newer).
+     * MNN CPU 生图（sd15-mnn）隐藏：不进下载列表 / runnableModels / generate_image；已下载的在存储页删除。
+     */
+    private val builtInListed: List<ImageModel> by lazy {
+        val arch = runCatching { DeviceProbe.htpArch(DeviceProbe.socModel()) }.getOrNull()
+        builtIn.filter { ImageRules.listed(it) && it.id !in LEGACY_IDS && (!it.sdq || ImageRules.sdqListed(arch)) }
+    }
+
+    /** 不再提供下载的模型（非商用转换包）；旧版下载过的仍可用、可删除。 */
+    val LEGACY_IDS = setOf(ANYTHING_V5_ID)
+    val legacy: List<ImageModel> get() = builtIn.filter { it.id in LEGACY_IDS }
+
+    /** 内置 + 用户导入的（导入清单变了就跟着变）。 */
+    val known: List<ImageModel> get() = builtIn + ImportedImages.models()
+    val all: List<ImageModel> get() = builtInListed + ImportedImages.models()
+
+    /** 已隐藏模型的目录名（存储页单独列出以便删除）。 */
+    const val SD15_MNN_ID = "sd15-mnn"
+
+    fun byId(id: String): ImageModel? = known.firstOrNull { it.id == id }
+}
+
+/** pure rules (unit-tested). */
+object ImageRules {
+    const val SDQ_MIN_HTP = 79
+    fun sdqListed(htpArch: Int?): Boolean = (htpArch ?: 0) >= SDQ_MIN_HTP
+    /** Backend.MNN_CPU 不再列出（下载、生图选择、generate_image 都排除）。 */
+    fun listed(m: ImageModel): Boolean = m.backend != Backend.MNN_CPU
+}

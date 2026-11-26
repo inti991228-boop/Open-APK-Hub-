@@ -1,0 +1,1523 @@
+// IRIS LocalAI — platform-independent llama.cpp chat engine.
+#include "iris_engine.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <chrono>
+#include <mutex>
+#include <thread>
+
+#include "ggml-backend.h"
+#ifdef IRIS_HTP
+#include <dlfcn.h>
+#include <android/log.h>
+#endif
+#ifdef IRIS_VULKAN
+#include <cctype>
+#include <cstdlib>
+#include <string>
+#include <android/log.h>
+#include <sys/system_properties.h>
+#endif
+#include "llama.h"
+#include "gguf.h"
+#ifdef IRIS_SPEC
+// 2.5.0-beta9: MTP self-speculative decoding through llama.cpp common/speculative (draft-mtp).
+#include "common.h"
+#include "speculative.h"
+#endif
+#ifdef IRIS_MTMD
+#include "mtmd.h"
+#include "mtmd-helper.h"
+#endif
+
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+#include <cerrno>
+#include <cstdarg>
+#include <cstdio>
+
+namespace iris {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+int64_t us_since(Clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count();
+}
+
+void backend_init_once() {
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+#ifdef IRIS_VULKAN
+        // 2.3.6: Vulkan is for Mali / Immortalis / Xclipse. On Qualcomm the Adreno OpenCL backend is
+        // faster and some Adreno Vulkan drivers crash in pipeline creation, and crash-safe mode
+        // (IRIS_NO_OPENCL=1) keeps every GPU driver out. Must run before the backend registry starts.
+        // IRIS_FORCE_VULKAN=1 (debug) skips the SoC check.
+        {
+            const char *force = getenv("IRIS_FORCE_VULKAN");
+            const char *no_gpu = getenv("IRIS_NO_OPENCL");
+            char soc[PROP_VALUE_MAX] = {0};
+            __system_property_get("ro.soc.manufacturer", soc);
+            std::string m(soc);
+            std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+            const bool qualcomm = m.find("qualcomm") != std::string::npos || m == "qti";
+            if ((no_gpu && no_gpu[0] == '1') || (qualcomm && !(force && force[0] == '1'))) {
+                setenv("GGML_DISABLE_VULKAN", "1", 1);
+            }
+            __android_log_print(ANDROID_LOG_INFO, "IrisNative", "vulkan: soc=%s -> %s", soc,
+                                getenv("GGML_DISABLE_VULKAN") ? "off" : "on");
+        }
+#endif
+        llama_backend_init();
+#ifdef IRIS_HTP
+        // 2.2.15: ggml-hexagon (upstream llama.cpp release build, same commit) is a separate shared
+        // library loaded by the app right after this one (soname renamed to libiris-hexagon.so, its
+        // libggml-base.so dependency pointed at us). Register its devices (HTP0 = type GPU).
+        void *h = dlopen("libiris-hexagon.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) h = dlopen("libiris-hexagon.so", RTLD_NOW);
+        auto reg_fn = h ? reinterpret_cast<ggml_backend_reg_t (*)()>(dlsym(h, "ggml_backend_hexagon_reg")) : nullptr;
+        if (reg_fn) {
+            ggml_backend_reg_t reg = reg_fn();
+            if (reg) ggml_backend_register(reg);
+        }
+        __android_log_print(ANDROID_LOG_INFO, "IrisNative", "hexagon backend: %s (%zu devices)",
+                            reg_fn ? "registered" : "not found", ggml_backend_dev_count());
+#endif
+    });
+}
+
+bool starts_with(const std::string &s, const std::string &prefix) {
+    return !prefix.empty() && s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool ends_with(const std::string &s, const std::string &suffix) {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+int32_t auto_threads() {
+    unsigned hc = std::thread::hardware_concurrency();
+    if (hc == 0) return 4;
+    // Leave headroom for the UI thread on 8-core phones.
+    int32_t n = (int32_t) hc - (hc >= 8 ? 2 : 1);
+    return std::clamp(n, 1, 8);
+}
+
+struct ProgressCtx {
+    const ProgressCallback *cb;
+};
+
+bool progress_trampoline(float p, void *ud) {
+    auto *pc = static_cast<ProgressCtx *>(ud);
+    if (!pc || !pc->cb || !*pc->cb) return true;
+    return (*pc->cb)(p);
+}
+
+LogSink g_log_sink = nullptr;
+int g_log_min_level = 3;
+
+// 2.2.14: OpenCL init/load progress for the Kotlin watchdog. ggml prints one "." (CONT) per
+// compiled kernel group and "ggml_opencl: ..." lines; the counter moving = not hung.
+std::atomic<int> g_gpu_ticks{0};
+std::mutex g_gpu_log_mu;
+std::string g_gpu_last;
+
+void log_trampoline(enum ggml_log_level level, const char *text, void *) {
+    if (text) {
+        if ((int) level == GGML_LOG_LEVEL_CONT) {
+            if (text[0] == '.') g_gpu_ticks.fetch_add(1, std::memory_order_relaxed);
+        } else if (std::strncmp(text, "ggml_opencl", 11) == 0 || std::strncmp(text, "ggml_vulkan", 11) == 0) {
+            std::lock_guard<std::mutex> lk(g_gpu_log_mu);
+            g_gpu_last.assign(text, strnlen(text, 240));
+            while (!g_gpu_last.empty() && (g_gpu_last.back() == '\n' || g_gpu_last.back() == '\r')) g_gpu_last.pop_back();
+            g_gpu_ticks.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (g_log_sink && (int) level >= g_log_min_level && (int) level != GGML_LOG_LEVEL_CONT) {
+        g_log_sink((int) level, text);
+    }
+}
+
+// 1.7.2: verifiable "the tier switch really reached the decoder" signal. On Android this goes to
+// logcat under tag IrisResource (adb logcat -s IrisResource), on the host to stderr.
+void resource_log(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+#if defined(__ANDROID__)
+    __android_log_write(ANDROID_LOG_INFO, "IrisResource", buf);
+#else
+    std::fprintf(stderr, "[IrisResource] %s\n", buf);
+#endif
+}
+
+#if defined(__linux__)
+// "0-3,6" style list of the cores in `set`.
+std::string cpuset_to_string(const cpu_set_t &set) {
+    std::string out;
+    int start = -1, prev = -2;
+    auto flush = [&]() {
+        if (start < 0) return;
+        if (!out.empty()) out += ',';
+        out += std::to_string(start);
+        if (prev != start) out += "-" + std::to_string(prev);
+    };
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &set)) continue;
+        if (c != prev + 1) { flush(); start = c; }
+        prev = c;
+    }
+    flush();
+    return out.empty() ? "?" : out;
+}
+#endif
+
+// 2.2.13: native renderers for templates llama_chat_apply_template (the non-jinja path) does not know.
+bool is_gemma4_template(const std::string &t) {
+    return t.find("<|turn>") != std::string::npos && t.find("<turn|>") != std::string::npos;
+}
+bool is_k2_template(const std::string &t) { return t.find("<|ifm|im_start|>") != std::string::npos; }
+// 2.4.4: Spark X2.5 / X2.6 (XHToken, arch spark2_5): <｜start▁of▁sentence｜><|User|>…<｜end▁of▁sentence｜>, <|Bot|>.
+bool is_spark_template(const std::string &t) {
+    return t.find("<|Bot|>") != std::string::npos && t.find("<|User|>") != std::string::npos &&
+           t.find("\xEF\xBD\x9Cstart\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C") != std::string::npos;
+}
+
+// 2.6.0: gpt-oss (harmony): the effort is a "Reasoning: low|medium|high" line in the system message.
+bool is_oss_template(const std::string &t) {
+    return t.find("<|channel|>") != std::string::npos && t.find("Reasoning:") != std::string::npos;
+}
+
+std::string trim_ws(const std::string &s) {
+    const size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    const size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+// Gemma 4: <|turn>role\n…<turn|>\n, thinking switched on by <|think|> in the first system turn and
+// off by an empty <|channel>thought block after the generation prompt (google-gemma-4 jinja).
+std::string format_gemma4(const std::vector<ChatMessage> &messages, bool think) {
+    std::string out;
+    size_t i = 0;
+    const bool sys = !messages.empty() && (messages[0].role == "system" || messages[0].role == "developer");
+    if (think || sys) {
+        out += "<|turn>system\n";
+        if (think) out += "<|think|>\n";
+        if (sys) { out += trim_ws(messages[0].content); i = 1; }
+        out += "<turn|>\n";
+    }
+    for (; i < messages.size(); i++) {
+        const std::string &r = messages[i].role;
+        const std::string role = r == "assistant" ? "model" : (r == "system" || r == "user") ? r : "user";
+        out += "<|turn>" + role + "\n" + trim_ws(messages[i].content) + "<turn|>\n";
+    }
+    out += "<|turn>model\n";
+    if (!think) out += "<|channel>thought\n<channel|>";
+    return out;
+}
+
+// Spark X2.6 (chat_template in the GGUF): one system block (its default line, the thinking-effort note when
+// thinking is on, then ours); every past reply starts with </think>; the generation prompt opens <think>
+// (thinking) or closes it right away (no thinking). Consecutive tool results share one <|Tool|> turn.
+std::string format_spark(const std::vector<ChatMessage> &messages, bool think, int effort) {
+    static const std::string BOS = "\xEF\xBD\x9Cstart\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C";
+    static const std::string EOS = "\xEF\xBD\x9C" "end\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C";
+    const std::string bos = "<" + BOS + ">", eos = "<" + EOS + ">";
+    std::string out = bos + "<|System|>\nyou are a helpful assistant.";
+    if (think) {
+        out += "\n`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), "
+               "supported values include `low` and `high`.\nNow the system is invoked with `thinking_effort=" + std::string(effort == 1 ? "low" : "high") + "`.";
+    }
+    size_t i = 0;
+    if (!messages.empty() && messages[0].role == "system") {
+        if (!messages[0].content.empty()) out += "\n\n" + messages[0].content;
+        i = 1;
+    }
+    out += eos;
+    for (; i < messages.size(); i++) {
+        const auto &m = messages[i];
+        if (m.role == "system") {
+            out += bos + "<|System|>\n" + m.content + eos;
+        } else if (m.role == "assistant") {
+            out += bos + "<|Bot|>";
+            if (m.content.rfind("<think>", 0) != 0) out += "</think>";
+            out += m.content + eos;
+        } else if (m.role == "tool") {
+            if (i == 0 || messages[i - 1].role != "tool") out += bos + "<|Tool|>";
+            out += "<tool_response>" + m.content + "</tool_response>";
+            if (i + 1 >= messages.size() || messages[i + 1].role != "tool") out += eos;
+        } else {
+            out += bos + "<|User|>" + m.content + eos;
+        }
+    }
+    out += bos + "<|Bot|>";
+    out += think ? "<think>" : "</think>";
+    return out;
+}
+
+// K2 Horizon (IFM-K2-Horizon.jinja): <|ifm|im_start|>role\n…<|ifm|im_end|>, no separator; every assistant
+// turn carries a (possibly empty) <ifm|think> block; the generation prompt opens one.
+std::string format_k2(const std::vector<ChatMessage> &messages, bool think) {
+    std::string out;
+    for (const auto &m : messages) {
+        if (m.role == "assistant") {
+            out += "<|ifm|im_start|>assistant\n<ifm|think>\n</ifm|think>" + m.content + "<|ifm|im_end|>";
+        } else {
+            out += "<|ifm|im_start|>" + m.role + "\n" + m.content + "<|ifm|im_end|>";
+        }
+    }
+    out += "<|ifm|im_start|>assistant\n<ifm|think>\n";
+    if (!think) out += "</ifm|think>";
+    return out;
+}
+}  // namespace
+
+int gpu_init_ticks() { return g_gpu_ticks.load(std::memory_order_relaxed); }
+
+std::string gpu_last_log() {
+    std::lock_guard<std::mutex> lk(g_gpu_log_mu);
+    return g_gpu_last;
+}
+
+void set_log_sink(LogSink sink, int min_level) {
+    g_log_sink = sink;
+    g_log_min_level = min_level;
+    llama_log_set(log_trampoline, nullptr);
+}
+
+size_t utf8_complete_prefix(std::string_view s) {
+    const size_t n = s.size();
+    size_t i = 0;
+    while (i < n) {
+        const auto c = (unsigned char) s[i];
+        size_t len;
+        if (c < 0x80) len = 1;
+        else if ((c >> 5) == 0x6) len = 2;
+        else if ((c >> 4) == 0xE) len = 3;
+        else if ((c >> 3) == 0x1E) len = 4;
+        else len = 1;  // invalid lead / stray continuation byte: pass through, never block the stream
+        if (i + len > n) break;  // incomplete trailing sequence: hold it back
+        i += len;
+    }
+    return i;
+}
+
+size_t stop_holdback(std::string_view text, const std::vector<std::string> &stops) {
+    size_t hold = 0;
+    for (const auto &stop : stops) {
+        if (stop.empty()) continue;
+        const size_t max_k = std::min(stop.size() - 1, text.size());
+        for (size_t k = max_k; k > hold; --k) {
+            if (text.compare(text.size() - k, k, stop, 0, k) == 0) {
+                hold = k;
+                break;
+            }
+        }
+    }
+    return hold;
+}
+
+size_t find_first_stop(std::string_view text, size_t from, const std::vector<std::string> &stops) {
+    size_t cut = std::string_view::npos;
+    for (const auto &stop : stops) {
+        if (stop.empty()) continue;
+        const size_t pos = text.find(stop, from);
+        if (pos < cut) cut = pos;
+    }
+    return cut;
+}
+
+Engine::~Engine() {
+    std::lock_guard<std::mutex> lk(mu_);
+    free_all();
+}
+
+void Engine::free_mmproj() {
+#ifdef IRIS_MTMD
+    if (mtmd_) mtmd_free(mtmd_);
+#endif
+    mtmd_ = nullptr;
+    mtmd_gpu_ = false;
+}
+
+void Engine::free_spec() {
+#ifdef IRIS_SPEC
+    if (spec_) common_speculative_free(spec_);
+#endif
+    spec_ = nullptr;
+    if (ctx_dft_) llama_free(ctx_dft_);
+    ctx_dft_ = nullptr;
+    spec_n_ = 0;
+    spec_sync_ = false;
+}
+
+// 2.5.0-beta10: a draft / verify / rollback step failed while generating (MTP is experimental on
+// the GPU backends): drop MTP for the rest of this load and keep decoding normally. Callers hold mu_.
+void Engine::spec_disable(const std::string &why) {
+    if (!spec_ && !ctx_dft_) return;
+    free_spec();
+    spec_status_ = "fallback: " + why;
+    resource_log("MTP off for this session (%s): normal decoding", why.c_str());
+}
+
+std::string Engine::spec_status() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return spec_status_;
+}
+
+void Engine::free_all() {
+    free_spec();
+    spec_status_ = "off";
+    free_mmproj();
+    mmproj_path_.clear();
+    if (ctx_) llama_free(ctx_);
+    if (model_) llama_model_free(model_);
+    ctx_ = nullptr;
+    model_ = nullptr;
+    vocab_ = nullptr;
+    template_.clear();
+    kv_tokens_.clear();
+    n_ctx_ = 0;
+}
+
+bool Engine::abort_cb(void *data) {
+    auto *self = static_cast<Engine *>(data);
+    return self->cancelled_.load(std::memory_order_relaxed);
+}
+
+// 2.5.1: 专家张量留 CPU 的 buffer-type override（pattern 是 std::regex，llama-model-loader 里 regex_search）
+static const llama_model_tensor_buft_override *moe_cpu_overrides() {
+    static llama_model_tensor_buft_override ov[2] = {
+        {"\\.ffn_(up|down|gate|gate_up)_exps", nullptr},
+        {nullptr, nullptr},
+    };
+    ov[0].buft = ggml_backend_cpu_buffer_type();
+    return ov;
+}
+
+// 2.5.1: 只读 GGUF 头，取 general.architecture 与 <arch>.expert_count（非 MoE 返回 0）
+static int64_t gguf_expert_count(const std::string &path, std::string &arch) {
+    gguf_init_params gp{/*no_alloc=*/true, /*ctx=*/nullptr};
+    gguf_context *g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) return 0;
+    int64_t n = 0;
+    const int64_t ka = gguf_find_key(g, "general.architecture");
+    if (ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING) {
+        arch = gguf_get_val_str(g, ka);
+        const int64_t ke = gguf_find_key(g, (arch + ".expert_count").c_str());
+        if (ke >= 0) {
+            switch (gguf_get_kv_type(g, ke)) {
+                case GGUF_TYPE_UINT32: n = gguf_get_val_u32(g, ke); break;
+                case GGUF_TYPE_INT32:  n = gguf_get_val_i32(g, ke); break;
+                case GGUF_TYPE_UINT64: n = (int64_t) gguf_get_val_u64(g, ke); break;
+                case GGUF_TYPE_INT64:  n = gguf_get_val_i64(g, ke); break;
+                default: break;
+            }
+        }
+    }
+    gguf_free(g);
+    return n;
+}
+
+// 2.5.4: LES — writes an "in-place" experts manifest that points straight into the GGUF
+// (each routed expert tensor is [.., .., n_expert] contiguous, so expert e of a family lives at
+// data_offset + e * bytes_per_expert). No repacked copy of the experts is needed on the phone.
+// Returns the manifest path, or an empty string with `why` set when the model is not eligible.
+static std::string les_write_manifest(const std::string &path, const std::string &dir,
+                                      int64_t expert_used_override, std::string &why) {
+    gguf_init_params gp{/*no_alloc=*/true, /*ctx=*/nullptr};
+    gguf_context *g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) { why = "gguf"; return {}; }
+    auto get_int = [&](const std::string &key) -> int64_t {
+        const int64_t k = gguf_find_key(g, key.c_str());
+        if (k < 0) return 0;
+        switch (gguf_get_kv_type(g, k)) {
+            case GGUF_TYPE_UINT32: return gguf_get_val_u32(g, k);
+            case GGUF_TYPE_INT32:  return gguf_get_val_i32(g, k);
+            case GGUF_TYPE_UINT64: return (int64_t) gguf_get_val_u64(g, k);
+            case GGUF_TYPE_INT64:  return gguf_get_val_i64(g, k);
+            default: return 0;
+        }
+    };
+    std::string arch;
+    const int64_t ka = gguf_find_key(g, "general.architecture");
+    if (ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING) arch = gguf_get_val_str(g, ka);
+    if (arch != "qwen35moe") { gguf_free(g); why = "arch:" + arch; return {}; }
+    if (get_int("split.count") > 1) { gguf_free(g); why = "split"; return {}; }
+    const int64_t n_expert = get_int(arch + ".expert_count");
+    int64_t n_used = get_int(arch + ".expert_used_count");
+    if (expert_used_override > 0) n_used = expert_used_override;
+    if (n_expert < 2 || n_used < 1) { gguf_free(g); why = "experts"; return {}; }
+
+    const size_t data_off = gguf_get_data_offset(g);
+    std::string entries;
+    int n_entries = 0;
+    const int64_t nt = gguf_get_n_tensors(g);
+    for (int64_t i = 0; i < nt; i++) {
+        const std::string name = gguf_get_tensor_name(g, i);
+        int layer = -1;
+        char fam[64] = {0};
+        if (std::sscanf(name.c_str(), "blk.%d.%63[^.].weight", &layer, fam) != 2) continue;
+        const std::string family(fam);
+        if (family != "ffn_gate_exps" && family != "ffn_up_exps" && family != "ffn_down_exps" &&
+            family != "ffn_gate_up_exps") continue;
+        if (name != "blk." + std::to_string(layer) + "." + family + ".weight") continue;
+        const size_t nbytes = gguf_get_tensor_size(g, i);
+        if (nbytes == 0 || nbytes % (size_t) n_expert != 0) { gguf_free(g); why = "shape:" + name; return {}; }
+        const size_t bpe = nbytes / (size_t) n_expert;
+        std::string tname = ggml_type_name(gguf_get_tensor_type(g, i));
+        for (auto &c : tname) c = (char) std::tolower((unsigned char) c);
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+                 "%s{\"layer\":%d,\"tensor_family\":\"%s\",\"tensor_name\":\"%s\",\"quant_type\":\"%s\","
+                 "\"repacked_file\":\"%s\",\"repacked_offset\":%zu,\"exact_byte_length\":%zu,"
+                 "\"bytes_per_expert\":%zu,\"expert_stride\":%zu,\"expert_count\":%lld}",
+                 n_entries ? "," : "", layer, family.c_str(), name.c_str(), tname.c_str(), "@MODEL@",
+                 data_off + gguf_get_tensor_offset(g, i), nbytes, bpe, bpe, (long long) n_expert);
+        entries += buf;
+        n_entries++;
+    }
+    gguf_free(g);
+    if (n_entries == 0) { why = "no_experts"; return {}; }
+    // the model path goes in once, JSON-escaped
+    std::string esc;
+    for (char c : path) {
+        if (c == '"' || c == '\\') esc += '\\';
+        esc += c;
+    }
+    size_t pos = 0;
+    while ((pos = entries.find("@MODEL@", pos)) != std::string::npos) {
+        entries.replace(pos, 7, esc);
+        pos += esc.size();
+    }
+    char head[256];
+    snprintf(head, sizeof(head),
+             "{\"schema_version\":1,\"experts_kind\":\"omni_moe_gguf\",\"layout\":\"layer_major_expert\","
+             "\"model\":{\"arch\":\"%s\",\"expert_count\":%lld,\"expert_used_count\":%lld},\"entries\":[",
+             arch.c_str(), (long long) n_expert, (long long) n_used);
+    const std::string out = dir + "/les-manifest.json";
+    FILE *f = std::fopen(out.c_str(), "wb");
+    if (!f) { why = "write"; return {}; }
+    const std::string json = std::string(head) + entries + "]}";
+    const bool ok = std::fwrite(json.data(), 1, json.size(), f) == json.size();
+    std::fclose(f);
+    if (!ok) { why = "write"; return {}; }
+    return out;
+}
+
+bool Engine::load(const std::string &path, const LoadParams &params,
+                  const ProgressCallback &progress, std::string &error) {
+    std::lock_guard<std::mutex> lk(mu_);
+    free_all();
+    backend_init_once();
+    cancelled_.store(false);
+    pending_threads_.store(0);
+
+    ProgressCtx pctx{&progress};
+    llama_model_params mp = llama_model_default_params();
+    gpu_name_.clear();
+    // Explicit device list: the GPU when offloading, otherwise *no* accelerator at all. With the
+    // default (all devices) llama.cpp would still initialise the OpenCL backend for a CPU-only
+    // load (driver init + kernel setup, extra memory) even though nothing runs on it.
+    ggml_backend_dev_t devices[2] = {nullptr, nullptr};
+    if (params.n_gpu_layers > 0) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(d);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                const char *desc = ggml_backend_dev_description(d);
+                gpu_name_ = desc && *desc ? desc : ggml_backend_dev_name(d);
+                devices[0] = d;
+                break;
+            }
+        }
+    }
+    mp.devices = devices;
+    mp.n_gpu_layers = devices[0] ? params.n_gpu_layers : 0;
+    mp.load_mode = params.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+    mp.progress_callback = progress_trampoline;
+    mp.progress_callback_user_data = &pctx;
+
+    // 2.5.1: MoE 专家按需加载。有 GPU 时专家张量 override 到 CPU buffer（mmap 按需读）；
+    // CPU-only 时专家本就 mmap，无需 override。
+    const bool moe_cpu = params.moe_cpu;
+    if (moe_cpu && devices[0]) mp.tensor_buft_overrides = moe_cpu_overrides();
+    // 2.5.1: CPU 额外 buffer（Q4_0 等 aarch64 repack / KleidiAI）会把权重复制到匿名内存，专家就不再按需从 mmap 读；
+    // 专家按需加载时关闭（代价：CPU 上这些量化的矩阵乘略慢）。
+    if (moe_cpu) mp.use_extra_bufts = false;
+    // 2.5.1: 激活专家数覆盖（kv_overrides 数组以 key[0]=0 结尾）
+    llama_model_kv_override kvo[2];
+    std::memset(kvo, 0, sizeof(kvo));
+    int64_t expert_used = 0;
+    if (params.n_expert_used > 0) {
+        std::string arch;
+        const int64_t n_exp = gguf_expert_count(path, arch);
+        if (n_exp > 1 && !arch.empty()) {
+            expert_used = std::clamp<int64_t>(params.n_expert_used, 1, n_exp);
+            kvo[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+            snprintf(kvo[0].key, sizeof(kvo[0].key), "%s.expert_used_count", arch.c_str());
+            kvo[0].val_i64 = expert_used;
+            kvo[1].key[0] = 0;
+            mp.kv_overrides = kvo;
+        }
+    }
+    // 2.5.4: LES. Eligible models only (qwen35moe, one-file GGUF); everything else loads as before.
+    les_state_.store(0);
+    std::string les_manifest;
+    if (params.les && !params.les_dir.empty()) {
+        std::string why;
+        les_manifest = les_write_manifest(path, params.les_dir, expert_used, why);
+        {
+            std::lock_guard<std::mutex> lk2(les_mu_);
+            les_note_ = les_manifest.empty() ? why : std::string();
+        }
+        les_state_.store(les_manifest.empty() ? -1 : 1);
+    }
+    if (!les_manifest.empty()) {
+        // read by the slot runtime once per process (static); same values every load
+        setenv("LLAMA_MOE_DECODE_WINDOW", "auto", 0);
+        setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", "1", 0);
+        setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH", "8", 0);
+        mp.moe_experts_path = les_manifest.c_str();
+        mp.moe_slot_bank = (int32_t) std::max<int64_t>(1, gguf_expert_count(path, les_arch_tmp_));
+        // CPU only: the slots must be CPU-addressable, and the expert reads replace the GPU path
+        devices[0] = nullptr;
+        gpu_name_.clear();
+        mp.n_gpu_layers = 0;
+        mp.tensor_buft_overrides = nullptr;
+    }
+    const bool no_prefetch = moe_cpu || params.no_prefetch || !les_manifest.empty();
+#ifdef LLAMA_HAS_MMAP_PREFETCH
+    llama_set_mmap_prefetch(!no_prefetch);
+#endif
+    resource_log("load: moe_cpu=%d%s expert_used=%lld no_prefetch=%d extra_bufts=%d les=%d",
+                 moe_cpu ? 1 : 0, (moe_cpu && devices[0]) ? "(exps->CPU)" : "",
+                 (long long) expert_used, no_prefetch ? 1 : 0, mp.use_extra_bufts ? 1 : 0, les_state_.load());
+#ifdef IRIS_SPEC
+    // 2.5.0-beta9: the NextN / MTP tensors are skipped unless asked for; only then can a draft
+    // context be built on this model. Off (the default) loads exactly as before.
+    spec_req_ = params.spec_draft;
+    mp.load_mtp = params.spec_draft > 0;
+#endif
+
+    model_ = llama_model_load_from_file(path.c_str(), mp);
+#ifdef LLAMA_HAS_MMAP_PREFETCH
+    llama_set_mmap_prefetch(true);  // 全局开关复位，不影响后续其它模型加载
+#endif
+    if (!model_) {
+        gpu_name_.clear();
+        error = "无法加载模型文件（文件损坏、格式不受支持或内存不足）";
+        return false;
+    }
+    vocab_ = llama_model_get_vocab(model_);
+
+    const int32_t n_train = llama_model_n_ctx_train(model_);
+    int32_t n_ctx = params.n_ctx > 0 ? params.n_ctx : 4096;
+    if (n_train > 0) n_ctx = std::min(n_ctx, n_train);
+    n_ctx = std::max(n_ctx, 512);
+
+    const int32_t threads = params.n_threads > 0 ? params.n_threads : auto_threads();
+    threads_ = threads;
+    n_batch_ = std::clamp(params.n_batch, 32, 2048);
+
+    int32_t kv_type = params.kv_type >= 0 ? params.kv_type : (params.kv_q8 ? 1 : 0);
+    if (!params.flash_attn) kv_type = 0;
+    // A quantised V cache needs Flash Attention; when AUTO resolves to "off" for this model /
+    // backend the context cannot be created. Retry once with the default F16 cache.
+    if (!create_context(params, n_ctx, threads, kv_type) &&
+        !(kv_type != 0 && create_context(params, n_ctx, threads, 0))) {
+        llama_model_free(model_);
+        model_ = nullptr;
+        vocab_ = nullptr;
+        gpu_name_.clear();
+        error = "无法创建推理上下文（内存不足？可尝试减小上下文长度）";
+        return false;
+    }
+    n_ctx_ = (int32_t) llama_n_ctx(ctx_);
+    init_spec(params);
+
+    const char *tmpl = llama_model_chat_template(model_, nullptr);
+    template_ = tmpl ? tmpl : "";
+
+    // Verify that llama.cpp recognises the embedded template; otherwise use ChatML.
+    use_chatml_fallback_ = template_.empty();
+    if (!use_chatml_fallback_ && !is_gemma4_template(template_) && !is_k2_template(template_) && !is_spark_template(template_)) {
+        llama_chat_message probe[] = {{"user", "hi"}};
+        if (llama_chat_apply_template(template_.c_str(), probe, 1, true, nullptr, 0) < 0) {
+            use_chatml_fallback_ = true;
+        }
+    }
+    return true;
+}
+
+bool Engine::create_context(const LoadParams &params, int32_t n_ctx, int32_t threads, int32_t kv_type) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = (uint32_t) n_ctx;
+    cp.n_batch = (uint32_t) n_batch_;
+    // Physical batch: 512 is the sweet spot for the CPU (KleidiAI / llamafile kernels) and keeps
+    // the compute buffer small; larger logical batches are still split by llama.cpp.
+    cp.n_ubatch = (uint32_t) std::min(n_batch_, 512);
+    cp.n_seq_max = 1;
+    cp.n_threads = threads;
+    cp.n_threads_batch = threads;
+    cp.flash_attn_type = params.flash_attn ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    if (kv_type == 1) {
+        cp.type_k = GGML_TYPE_Q8_0;
+        cp.type_v = GGML_TYPE_Q8_0;
+    } else if (kv_type == 2) {
+        cp.type_k = GGML_TYPE_Q4_0;
+        cp.type_v = GGML_TYPE_Q4_0;
+    }
+    cp.abort_callback = &Engine::abort_cb;
+    cp.abort_callback_data = this;
+    cp.no_perf = true;
+#ifdef IRIS_SPEC
+    // 2.5.0-beta9: recurrent / hybrid models (e.g. Qwen3-Next) can only roll back rejected draft
+    // tokens through recurrent-state snapshots, one per draft position.
+    if (spec_req_ > 0 && (llama_model_is_recurrent(model_) || llama_model_is_hybrid(model_)))
+        cp.n_rs_seq = (uint32_t) spec_req_;
+#endif
+    ctx_ = llama_init_from_model(model_, cp);
+    return ctx_ != nullptr;
+}
+
+// 2.5.0-beta9: MTP self-speculative decoding. Every step on failure records the reason and leaves
+// the engine on normal decoding; nothing here can fail the load.
+void Engine::init_spec(const LoadParams &params) {
+    free_spec();
+    spec_status_ = "off";
+    if (params.spec_draft <= 0) return;
+#ifndef IRIS_SPEC
+    spec_status_ = "fallback: speculative decoding not built in";
+#else
+    const int32_t n_draft = std::clamp(params.spec_draft, 1, 8);
+    auto fail = [&](const char *why) {
+        free_spec();
+        llama_memory_clear(llama_get_memory(ctx_), true);
+        spec_status_ = std::string("fallback: ") + why;
+        resource_log("MTP %s", spec_status_.c_str());
+    };
+    if (llama_model_n_layer_nextn(model_) <= 0) { fail("model has no MTP layers"); return; }
+    // Rejected drafts are removed from the target memory: needs partial removal (attention) or
+    // recurrent snapshots for at least n_draft tokens.
+    const auto rm_tgt = common_context_can_seq_rm(ctx_);
+    if (rm_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+        if ((int32_t) llama_n_rs_seq(ctx_) < n_draft) { fail("not enough recurrent snapshots"); return; }
+    } else if (rm_tgt != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+        fail("target memory cannot drop rejected drafts"); return;
+    }
+    llama_context_params cp = llama_context_default_params();
+    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cp.n_ctx = llama_n_ctx(ctx_);
+    cp.n_batch = (uint32_t) n_batch_;
+    cp.n_ubatch = (uint32_t) std::min(n_batch_, 512);
+    cp.n_seq_max = 1;
+    cp.n_rs_seq = 0;
+    cp.n_threads = threads_;
+    cp.n_threads_batch = threads_;
+    cp.flash_attn_type = params.flash_attn ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.abort_callback = &Engine::abort_cb;
+    cp.abort_callback_data = this;
+    cp.no_perf = true;
+    cp.ctx_other = ctx_;
+    ctx_dft_ = llama_init_from_model(model_, cp);
+    if (!ctx_dft_) { fail("cannot create the MTP context"); return; }
+    if (llama_model_n_embd_out(llama_get_model(ctx_dft_)) != llama_model_n_embd_out(model_)) { fail("MTP width mismatch"); return; }
+    if (common_context_can_seq_rm(ctx_dft_) != COMMON_CONTEXT_SEQ_RM_TYPE_PART) { fail("MTP memory cannot drop drafts"); return; }
+    common_params_speculative sp;
+    sp.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+    sp.draft.n_max = n_draft;
+    sp.draft.n_min = 0;
+    sp.draft.backend_sampling = false;
+    sp.draft.ctx_tgt = ctx_;
+    sp.draft.ctx_dft = ctx_dft_;
+    try {
+        spec_ = common_speculative_init(sp, 1);
+    } catch (...) {
+        spec_ = nullptr;
+    }
+    if (!spec_) { fail("speculative init failed"); return; }
+    spec_n_ = std::max(1, (int32_t) common_speculative_n_max(spec_));
+    llama_memory_clear(llama_get_memory(ctx_), true);
+    llama_memory_clear(llama_get_memory(ctx_dft_), true);
+    kv_tokens_.clear();
+    spec_sync_ = true;
+    spec_status_ = "active n=" + std::to_string(spec_n_);
+    resource_log("MTP %s (nextn layers=%d, rs_seq=%u)", spec_status_.c_str(),
+                 (int) llama_model_n_layer_nextn(model_), (unsigned) llama_n_rs_seq(ctx_));
+#endif
+}
+
+// Drops draft-context memory from position `from` on (whole memory when from <= 0).
+void Engine::spec_mem_rm(int32_t from) {
+    if (!ctx_dft_) return;
+    llama_memory_t m = llama_get_memory(ctx_dft_);
+    if (!m) return;
+    if (from <= 0 || !llama_memory_seq_rm(m, 0, from, -1)) {
+        llama_memory_clear(m, true);
+        if (from > 0) spec_sync_ = false;
+    }
+}
+
+// Decodes tokens[from, from+n) on the target at positions kv_tokens_.size()... and feeds the same
+// batch to the speculative state. Output (logits) only for the last entry when `last_out`.
+int32_t Engine::spec_decode(const std::vector<int32_t> &tokens, size_t from, size_t n, bool last_out) {
+#ifdef IRIS_SPEC
+    common_batch b(ctx_);
+    const llama_pos p0 = (llama_pos) kv_tokens_.size();
+    for (size_t k = 0; k < n; ++k) b.add(tokens[from + k], p0 + (llama_pos) k, 0, last_out && k + 1 == n);
+    const int32_t rc = llama_process(ctx_, LLAMA_PROCESS_TYPE_DECODE, b.get());
+    if (rc != 0) return rc;
+    bool ok = false;
+    try { ok = common_speculative_process(spec_, b); } catch (...) { ok = false; }
+    if (!ok) spec_disable("prompt process failed");
+    return 0;
+#else
+    (void) tokens; (void) from; (void) n; (void) last_out;
+    return -1;
+#endif
+}
+
+void Engine::unload() {
+    cancel();
+    std::lock_guard<std::mutex> lk(mu_);
+    free_all();
+}
+
+void Engine::set_threads(int32_t n_threads) {
+    if (n_threads <= 0) return;
+    pending_threads_.store(n_threads, std::memory_order_release);
+    // Apply right away when idle; a running generate() picks it up before its next decode.
+    std::unique_lock<std::mutex> lk(mu_, std::try_to_lock);
+    if (lk.owns_lock()) apply_pending_threads();
+}
+
+void Engine::apply_pending_threads() {
+    const int32_t n = pending_threads_.exchange(0, std::memory_order_acq_rel);
+    if (n > 0 && ctx_) llama_set_n_threads(ctx_, n, n);
+    if (n > 0 && ctx_dft_) llama_set_n_threads(ctx_dft_, n, n);
+}
+
+void Engine::request_live_policy(int32_t n_threads, const std::vector<int32_t> &cpus, int32_t nice) {
+    if (n_threads <= 0) return;
+    {
+        std::lock_guard<std::mutex> lk(policy_mu_);
+        pending_policy_.threads = n_threads;
+        pending_policy_.cpus = cpus;
+        pending_policy_.nice = nice;
+    }
+    policy_pending_.store(true, std::memory_order_release);
+    resource_log("live switch requested: threads=%d cpus=%zu nice=%d (applies before the next llama_decode)",
+                 n_threads, cpus.size(), nice);
+}
+
+// Runs on the decoding thread, between two llama_decode calls (never while one is running), so
+// llama_set_n_threads cannot race graph_compute(), which reads cparams.n_threads per graph.
+bool Engine::apply_pending_policy(int32_t token_index) {
+    if (!policy_pending_.load(std::memory_order_acquire)) return false;
+    LivePolicy p;
+    {
+        std::lock_guard<std::mutex> lk(policy_mu_);
+        if (!policy_pending_.exchange(false, std::memory_order_acq_rel)) return false;
+        p = pending_policy_;
+    }
+    if (!ctx_ || p.threads <= 0) return false;
+    pending_threads_.store(0, std::memory_order_release);  // superseded by this request
+    llama_set_n_threads(ctx_, p.threads, p.threads);
+    if (ctx_dft_) llama_set_n_threads(ctx_dft_, p.threads, p.threads);
+    const int32_t n_now = llama_n_threads(ctx_);
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (!p.cpus.empty()) {
+        for (int32_t c : p.cpus) if (c >= 0 && c < CPU_SETSIZE) CPU_SET(c, &set);
+    } else {
+        const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+        for (long c = 0; c < ncpu && c < CPU_SETSIZE; ++c) CPU_SET((int) c, &set);
+    }
+    const bool aff_ok = sched_setaffinity(0, sizeof(set), &set) == 0;
+    const pid_t tid = (pid_t) syscall(SYS_gettid);
+    const bool prio_ok = setpriority(PRIO_PROCESS, (id_t) tid, std::clamp<int32_t>(p.nice, -10, 19)) == 0;
+    // Read back what the kernel actually holds for this thread: this is what the next graph's
+    // freshly created ggml workers inherit.
+    cpu_set_t now;
+    CPU_ZERO(&now);
+    const std::string cores = sched_getaffinity(0, sizeof(now), &now) == 0 ? cpuset_to_string(now) : "?";
+    errno = 0;
+    const int nice_now = getpriority(PRIO_PROCESS, (id_t) tid);
+    resource_log("live switch APPLIED at token %d: tid=%d llama_n_threads=%d cpus=%s%s nice=%d%s",
+                 token_index, (int) tid, n_now, cores.c_str(), aff_ok ? "" : " (setaffinity failed)",
+                 nice_now, prio_ok ? "" : " (setpriority failed)");
+#else
+    resource_log("live switch APPLIED at token %d: llama_n_threads=%d (affinity/priority unsupported here)",
+                 token_index, n_now);
+#endif
+    return true;
+}
+
+bool Engine::init_mmproj(bool use_gpu, std::string &error) {
+#ifdef IRIS_MTMD
+    mtmd_context_params mp = mtmd_context_params_default();
+    mp.use_gpu = use_gpu;
+    mp.print_timings = false;
+    mp.n_threads = threads_ > 0 ? threads_ : auto_threads();
+    mp.warmup = false;
+    mtmd_ = mtmd_init_from_file(mmproj_path_.c_str(), model_, mp);
+    mtmd_gpu_ = mtmd_ != nullptr && use_gpu;
+    if (mtmd_ && !mtmd_support_vision(mtmd_)) {
+        free_mmproj();
+        error = "该 mmproj 不含视觉编码器";
+        return false;
+    }
+    if (!mtmd_) error = "无法加载 mmproj（与模型不匹配、文件损坏或内存不足）";
+    return mtmd_ != nullptr;
+#else
+    (void) use_gpu;
+    error = "此运行库不支持 mmproj";
+    return false;
+#endif
+}
+
+bool Engine::load_mmproj(const std::string &path, bool prefer_gpu, std::string &error) {
+    std::lock_guard<std::mutex> lk(mu_);
+    free_mmproj();
+    mmproj_path_ = path;
+    if (path.empty()) return true;
+    if (!model_) { error = "模型未加载"; return false; }
+    if (prefer_gpu && !gpu_name_.empty() && init_mmproj(true, error)) return true;
+    error.clear();
+    if (init_mmproj(false, error)) return true;
+    mmproj_path_.clear();
+    return false;
+}
+
+void Engine::reset() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (ctx_) llama_memory_clear(llama_get_memory(ctx_), true);
+    kv_tokens_.clear();
+    if (spec_) { spec_mem_rm(0); spec_sync_ = true; }
+}
+
+ModelMeta Engine::meta() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    ModelMeta m;
+    if (!model_) return m;
+    char buf[256];
+    if (llama_model_desc(model_, buf, sizeof(buf)) > 0) m.description = buf;
+    if (llama_model_meta_val_str(model_, "general.architecture", buf, sizeof(buf)) > 0) m.architecture = buf;
+    m.n_params = llama_model_n_params(model_);
+    m.size_bytes = llama_model_size(model_);
+    m.n_ctx_train = llama_model_n_ctx_train(model_);
+    m.n_ctx = n_ctx_;
+    m.gpu = gpu_name_;
+    m.has_chat_template = !use_chatml_fallback_;
+    m.supports_thinking = template_.find("<think>") != std::string::npos ||
+                          is_gemma4_template(template_) || is_k2_template(template_) || is_oss_template(template_);
+    m.think_effort = is_oss_template(template_) ? "oss" : is_spark_template(template_) ? "spark" : "";
+    if (m.supports_thinking) {
+        const std::string probe = format_prompt({{"user", "hi"}}, false);
+        m.thinking_prefilled = ends_with(probe, "<think>\n") || ends_with(probe, "<think>") ||
+                               ends_with(probe, "<ifm|think>\n");
+    }
+    return m;
+}
+
+std::string Engine::format_prompt(const std::vector<ChatMessage> &messages, bool disable_thinking, int effort) const {
+    if (is_gemma4_template(template_)) return format_gemma4(messages, !disable_thinking);
+    if (is_k2_template(template_)) return format_k2(messages, !disable_thinking);
+    if (is_spark_template(template_)) return format_spark(messages, !disable_thinking, effort);
+    std::vector<ChatMessage> oss_msgs;
+    const std::vector<ChatMessage> *src = &messages;
+    if (is_oss_template(template_) && (effort > 0 || disable_thinking)) {
+        // 2.6.0: 思考档位 → gpt-oss reasoning effort (思考关 = low, it cannot switch reasoning off).
+        const int e = disable_thinking ? 1 : effort;
+        const std::string line = std::string("Reasoning: ") + (e == 1 ? "low" : e == 2 ? "medium" : "high");
+        oss_msgs = messages;
+        if (!oss_msgs.empty() && (oss_msgs[0].role == "system" || oss_msgs[0].role == "developer")) {
+            oss_msgs[0].content = line + "\n\n" + oss_msgs[0].content;
+        } else {
+            oss_msgs.insert(oss_msgs.begin(), ChatMessage{"system", line});
+        }
+        src = &oss_msgs;
+    }
+    std::vector<llama_chat_message> chat;
+    chat.reserve(src->size());
+    for (const auto &m : *src) chat.push_back({m.role.c_str(), m.content.c_str()});
+
+    const char *tmpl = use_chatml_fallback_ ? "chatml" : template_.c_str();
+    int32_t need = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, nullptr, 0);
+    std::string out;
+    if (need > 0) {
+        out.resize((size_t) need);
+        int32_t wrote = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, out.data(), need);
+        if (wrote < 0) out.clear();
+        else out.resize((size_t) std::min(wrote, need));
+    }
+    if (out.empty()) {
+        // Last resort: hand-written ChatML.
+        for (const auto &m : messages) {
+            out += "<|im_start|>" + m.role + "\n" + m.content + "<|im_end|>\n";
+        }
+        out += "<|im_start|>assistant\n";
+    }
+
+    // 2.5.9: Qwen3.5 小模型（0.8B/2B 等）模板默认不思考，只有 enable_thinking=true 才开 <think>。
+    // llama_chat_apply_template 不跑 jinja、不传这个开关，所以开思考时由我们补上 <think>\n。
+    if (!disable_thinking && template_.find("enable_thinking") != std::string::npos &&
+        template_.find("<think>") != std::string::npos && ends_with(out, "assistant\n")) {
+        out += "<think>\n";
+    }
+    if (disable_thinking && template_.find("<think>") != std::string::npos) {
+        // Same trick Qwen3 uses for enable_thinking=false: pre-fill an empty reasoning block.
+        if (ends_with(out, "<think>\n")) out += "\n</think>\n\n";
+        else out += "<think>\n\n</think>\n\n";
+    }
+    return out;
+}
+
+std::vector<int32_t> Engine::tokenize(const std::string &text) const {
+    std::vector<int32_t> tokens;
+    if (!vocab_) return tokens;
+    bool add_bos = llama_vocab_get_add_bos(vocab_);
+    if (add_bos) {
+        const llama_token bos = llama_vocab_bos(vocab_);
+        const char *bos_text = bos != LLAMA_TOKEN_NULL ? llama_vocab_get_text(vocab_, bos) : nullptr;
+        // The chat template usually already starts with the BOS text; avoid a double BOS.
+        if (bos_text && starts_with(text, bos_text)) add_bos = false;
+    }
+    int32_t n = -llama_tokenize(vocab_, text.c_str(), (int32_t) text.size(), nullptr, 0, add_bos, true);
+    if (n <= 0) return tokens;
+    tokens.resize((size_t) n);
+    int32_t got = llama_tokenize(vocab_, text.c_str(), (int32_t) text.size(),
+                                 tokens.data(), n, add_bos, true);
+    if (got < 0) tokens.clear();
+    else tokens.resize((size_t) got);
+    return tokens;
+}
+
+void Engine::resync_after_failure() {
+    // On abort llama_decode may leave already-processed ubatches in memory; drop everything
+    // past what we track so kv_tokens_ stays the single source of truth.
+    llama_memory_t mem = llama_get_memory(ctx_);
+    if (!llama_memory_seq_rm(mem, 0, (llama_pos) kv_tokens_.size(), -1)) {
+        llama_memory_clear(mem, true);
+        kv_tokens_.clear();
+    }
+    if (spec_) {
+        spec_mem_rm((int32_t) kv_tokens_.size());
+        if (kv_tokens_.empty()) spec_sync_ = true;
+    }
+}
+
+bool Engine::decode_tokens(const std::vector<int32_t> &tokens, size_t from, GenerateStats &st) {
+    for (size_t i = from; i < tokens.size(); i += (size_t) n_batch_) {
+        if (cancelled_.load(std::memory_order_relaxed)) {
+            st.stop = StopReason::Cancelled;
+            return false;
+        }
+        if (apply_pending_policy(-1)) st.live_switches++;
+        const int32_t n = (int32_t) std::min<size_t>((size_t) n_batch_, tokens.size() - i);
+        int32_t rc;
+        if (spec_ && spec_sync_) {
+            // 2.5.0-beta9: the MTP head sees every prompt chunk the target decodes.
+            rc = spec_decode(tokens, i, (size_t) n, i + (size_t) n == tokens.size());
+            if (rc != 0 && rc != 2 && !cancelled_.load()) {
+                // 2.5.0-beta10: retry this chunk without MTP when the target memory is intact.
+                const size_t had = kv_tokens_.size();
+                spec_disable("prompt decode failed (" + std::to_string(rc) + ")");
+                resync_after_failure();
+                if (kv_tokens_.size() == had) {
+                    llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(tokens.data() + i), n);
+                    rc = llama_decode(ctx_, batch);
+                }
+            }
+        } else {
+            llama_batch batch = llama_batch_get_one(const_cast<llama_token *>(tokens.data() + i), n);
+            rc = llama_decode(ctx_, batch);
+        }
+        if (rc != 0) {
+            if (rc == 2 || cancelled_.load()) {
+                st.stop = StopReason::Cancelled;
+            } else {
+                st.stop = StopReason::Error;
+                st.error = "llama_decode 失败 (" + std::to_string(rc) + ")";
+            }
+            resync_after_failure();
+            return false;
+        }
+        kv_tokens_.insert(kv_tokens_.end(), tokens.begin() + (long) i, tokens.begin() + (long) i + n);
+    }
+    return true;
+}
+
+bool Engine::shift_context(int32_t n_keep, GenerateStats &st) {
+    // llama.cpp-style context shift: keep [0, n_keep) (attention sink + system prompt), drop half of
+    // the rest and slide the remainder down. Needs a memory that supports position shifting
+    // (not SWA-only / recurrent models); otherwise the caller stops with ContextFull.
+    llama_memory_t mem = llama_get_memory(ctx_);
+    if (!llama_memory_can_shift(mem)) return false;
+    // 2.2.17: picture cells (-1) carry their own positions (M-RoPE etc.); never shift them.
+    if (std::find(kv_tokens_.begin(), kv_tokens_.end(), -1) != kv_tokens_.end()) return false;
+    const int32_t n_past = (int32_t) kv_tokens_.size();
+    n_keep = std::clamp(n_keep, 0, n_past / 4);
+    const int32_t n_left = n_past - n_keep;
+    const int32_t n_discard = n_left / 2;
+    if (n_discard <= 0) return false;
+    if (!llama_memory_seq_rm(mem, 0, n_keep, n_keep + n_discard)) return false;
+    llama_memory_seq_add(mem, 0, n_keep + n_discard, n_past, -n_discard);
+    kv_tokens_.erase(kv_tokens_.begin() + n_keep, kv_tokens_.begin() + n_keep + n_discard);
+    st.shifted_tokens += n_discard;
+    if (spec_) spec_sync_ = false;  // the MTP context is not shifted: normal decoding until the next clear
+    return true;
+}
+
+bool Engine::reuse_prefix(std::vector<int32_t> &tokens, bool need_tail, GenerateStats &st) {
+    llama_memory_t mem = llama_get_memory(ctx_);
+    size_t n_common = 0;
+    while (n_common < kv_tokens_.size() && n_common < tokens.size() &&
+           kv_tokens_[n_common] == tokens[n_common]) {
+        n_common++;
+    }
+    if (need_tail && n_common == tokens.size() && n_common > 0) n_common--;  // need at least one token to produce logits
+    if (n_common < kv_tokens_.size()) {
+        bool keep = n_common > 0;
+        if (keep) {
+            // Sliding-window attention only keeps the last n_swa positions: rolling back to
+            // n_common is valid only if the window ending there is still materialised.
+            const int32_t n_swa = llama_model_n_swa(model_);
+            if (n_swa > 0) {
+                const llama_pos pos_min = llama_memory_seq_pos_min(mem, 0);
+                if (pos_min > std::max<int32_t>(0, (int32_t) n_common - n_swa)) keep = false;
+            }
+        }
+        if (!keep || !llama_memory_seq_rm(mem, 0, (llama_pos) n_common, -1)) {
+            llama_memory_clear(mem, true);  // e.g. SWA / recurrent memory cannot be partially removed
+            n_common = 0;
+        }
+        kv_tokens_.resize(n_common);
+        if (spec_) {
+            spec_mem_rm((int32_t) n_common);
+            if (n_common == 0) spec_sync_ = true;  // both memories empty: in step again
+        }
+    } else if (spec_ && n_common == 0) {
+        spec_mem_rm(0);
+        spec_sync_ = true;
+    }
+    st.reused_tokens = (int32_t) n_common;
+
+    return true;
+}
+
+bool Engine::prefill_media(const std::string &prompt, const std::vector<std::string> &images, GenerateStats &st) {
+#ifdef IRIS_MTMD
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::vector<mtmd_bitmap *> bitmaps;
+        auto free_bitmaps = [&]() { for (auto *b : bitmaps) mtmd_bitmap_free(b); bitmaps.clear(); };
+        for (const auto &path : images) {
+            mtmd_helper_bitmap_wrapper w = mtmd_helper_bitmap_init_from_file(mtmd_, path.c_str(), false, mtmd_helper_init_opt_default());
+            if (w.video_ctx) mtmd_helper_video_free(w.video_ctx);
+            if (!w.bitmap) {
+                free_bitmaps();
+                st.stop = StopReason::Error;
+                st.error = "图片读取失败：" + path;
+                return false;
+            }
+            bitmaps.push_back(w.bitmap);
+        }
+        mtmd_input_chunks *chunks = mtmd_input_chunks_init();
+        bool add_bos = llama_vocab_get_add_bos(vocab_);
+        if (add_bos) {
+            const llama_token bos = llama_vocab_bos(vocab_);
+            const char *bos_text = bos != LLAMA_TOKEN_NULL ? llama_vocab_get_text(vocab_, bos) : nullptr;
+            if (bos_text && starts_with(prompt, bos_text)) add_bos = false;  // template already has BOS
+        }
+        mtmd_input_text txt{prompt.c_str(), prompt.size(), add_bos, true};
+        const int32_t rc = mtmd_tokenize(mtmd_, chunks, &txt, (const mtmd_bitmap **) bitmaps.data(), bitmaps.size());
+        free_bitmaps();
+        if (rc != 0) {
+            mtmd_input_chunks_free(chunks);
+            st.stop = StopReason::Error;
+            st.error = rc == 1 ? "图片数量与提示词中的占位符不一致" : "图片预处理失败 (" + std::to_string(rc) + ")";
+            return false;
+        }
+        const size_t n_chunks = mtmd_input_chunks_size(chunks);
+        st.prompt_tokens = (int32_t) mtmd_helper_get_n_tokens(chunks);
+        // Leading text chunk: same KV prefix reuse as text-only turns (system prompt stays cached).
+        size_t first = 0;
+        if (n_chunks > 0 && mtmd_input_chunk_get_type(mtmd_input_chunks_get(chunks, 0)) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t nt = 0;
+            const llama_token *tt = mtmd_input_chunk_get_tokens_text(mtmd_input_chunks_get(chunks, 0), &nt);
+            std::vector<int32_t> head(tt, tt + nt);
+            if (!reuse_prefix(head, n_chunks == 1, st) || !decode_tokens(head, (size_t) st.reused_tokens, st)) {
+                mtmd_input_chunks_free(chunks);
+                return false;
+            }
+            first = 1;
+        } else {
+            llama_memory_clear(llama_get_memory(ctx_), true);
+            kv_tokens_.clear();
+        }
+        llama_pos n_past = (llama_pos) kv_tokens_.size();
+        bool media_failed = false;
+        for (size_t c = first; c < n_chunks; ++c) {
+            if (cancelled_.load(std::memory_order_relaxed)) { st.stop = StopReason::Cancelled; break; }
+            const mtmd_input_chunk *ch = mtmd_input_chunks_get(chunks, c);
+            const bool is_text = mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_TEXT;
+            llama_pos np = n_past;
+            const int32_t r = mtmd_helper_eval_chunk_single(mtmd_, ctx_, ch, n_past, 0, n_batch_, c + 1 == n_chunks, &np);
+            if (r != 0) {
+                if (cancelled_.load()) st.stop = StopReason::Cancelled;
+                else { st.stop = StopReason::Error; st.error = "图片编码/解码失败 (" + std::to_string(r) + ")"; media_failed = !is_text; }
+                break;
+            }
+            if (is_text) {
+                size_t nt = 0;
+                const llama_token *tt = mtmd_input_chunk_get_tokens_text(ch, &nt);
+                kv_tokens_.insert(kv_tokens_.end(), tt, tt + nt);
+            } else {
+                // Media cells never match a text token, so a later turn reuses the cache only up to here.
+                kv_tokens_.insert(kv_tokens_.end(), mtmd_input_chunk_get_n_tokens(ch), (int32_t) -1);
+            }
+            n_past = np;
+        }
+        mtmd_input_chunks_free(chunks);
+        if (st.stop == StopReason::Cancelled || st.stop == StopReason::Error) {
+            resync_after_failure();
+            // GPU vision encoder failed: reload the projector on the CPU and try once more.
+            if (media_failed && mtmd_gpu_ && attempt == 0) {
+                std::string err;
+                free_mmproj();
+                if (init_mmproj(false, err)) {
+                    __android_log_print(ANDROID_LOG_WARN, "IrisNative", "mtmd: GPU encode failed, retrying on CPU");
+                    const int32_t dropped = st.dropped_messages;
+                    st = GenerateStats{};
+                    st.dropped_messages = dropped;
+                    continue;
+                }
+            }
+            return false;
+        }
+        st.stop = StopReason::EndOfGeneration;
+        return true;
+    }
+    return false;
+#else
+    (void) prompt; (void) images;
+    st.stop = StopReason::Error;
+    st.error = "此运行库不支持图片";
+    return false;
+#endif
+}
+
+GenerateStats Engine::generate(const std::vector<ChatMessage> &input,
+                               const SamplingParams &sp, const PieceCallback &on_piece) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return generate_impl(input, sp, on_piece, nullptr, -1);
+}
+
+GenerateStats Engine::generate_vision(const std::vector<ChatMessage> &input, const SamplingParams &sp,
+                                      const PieceCallback &on_piece, const std::vector<std::string> &images,
+                                      int32_t image_msg) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return generate_impl(input, sp, on_piece, images.empty() ? nullptr : &images, image_msg);
+}
+
+GenerateStats Engine::generate_impl(const std::vector<ChatMessage> &input, const SamplingParams &sp,
+                                    const PieceCallback &on_piece, const std::vector<std::string> *images,
+                                    int32_t image_msg) {
+    GenerateStats st;
+    if (!ctx_) {
+        st.stop = StopReason::Error;
+        st.error = "模型未加载";
+        return st;
+    }
+    if (!sp.honor_prior_cancel) cancelled_.store(false, std::memory_order_release);
+    apply_pending_threads();
+
+    // ---- 1. Format & fit into the context window (drop oldest turns, keep system prompt) ----
+    const int32_t reserve = std::clamp(sp.max_new_tokens, 64, n_ctx_ / 2);
+    const int32_t budget = n_ctx_ - reserve;
+    std::vector<ChatMessage> messages = input;
+#ifdef IRIS_MTMD
+    // 2.2.17: one media marker per picture in front of the user's text (mtmd splits on it).
+    const bool vision = images && mtmd_ && image_msg >= 0 && image_msg < (int32_t) messages.size();
+    if (vision) {
+        std::string pre;
+        for (size_t k = 0; k < images->size(); ++k) pre += std::string(mtmd_default_marker()) + "\n";
+        messages[(size_t) image_msg].content = pre + messages[(size_t) image_msg].content;
+    }
+#else
+    const bool vision = false;
+    (void) images; (void) image_msg;
+#endif
+    std::string prompt;
+    std::vector<int32_t> tokens;
+    for (;;) {
+        prompt = format_prompt(messages, sp.disable_thinking, sp.think_effort);
+        tokens = tokenize(prompt);
+        if ((int32_t) tokens.size() <= budget) break;
+        // Find the oldest non-system message that is not the final user turn.
+        auto it = std::find_if(messages.begin(), messages.end(),
+                               [](const ChatMessage &m) { return m.role != "system"; });
+        if (it == messages.end() || it + 1 >= messages.end()) {
+            st.stop = StopReason::ContextFull;
+            st.error = "输入内容超出上下文长度（" + std::to_string(tokens.size()) + " / " +
+                       std::to_string(budget) + " tokens），请缩短内容或在设置中增大上下文";
+            return st;
+        }
+        const bool was_user = it->role == "user";
+        it = messages.erase(it);
+        st.dropped_messages++;
+        // Drop the reply that answered it as well: many templates (Gemma, Mistral, …) reject a
+        // history that starts with an assistant turn or does not alternate, and then the whole
+        // prompt would silently fall back to hand-written ChatML.
+        while (was_user && it != messages.end() && it + 1 != messages.end() && it->role == "assistant") {
+            it = messages.erase(it);
+            st.dropped_messages++;
+        }
+    }
+    if (tokens.empty()) {
+        st.stop = StopReason::Error;
+        st.error = "提示词分词失败";
+        return st;
+    }
+    st.prompt_tokens = (int32_t) tokens.size();
+
+    // ---- 2+3. KV-cache prefix reuse + prefill (2.2.17: pictures through mtmd) ----
+    const auto t_prefill = Clock::now();
+    if (vision) {
+        // 2.5.0-beta9: picture prefill bypasses the MTP head → normal decoding until the next clear.
+        if (spec_) spec_sync_ = false;
+        if (!prefill_media(prompt, *images, st)) return st;
+    } else {
+        if (!reuse_prefix(tokens, true, st)) return st;
+        if (!decode_tokens(tokens, (size_t) st.reused_tokens, st)) return st;
+    }
+    st.prefill_us = us_since(t_prefill);
+
+    // ---- 4. Sampler chain (penalties → top-k → top-p → min-p → temperature → dist) ----
+    llama_sampler *smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (sp.temperature <= 0.0f) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+    } else {
+        if (sp.repeat_penalty > 0.0f && sp.repeat_penalty != 1.0f && sp.repeat_last_n != 0) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
+                    llama_vocab_n_tokens(vocab_), sp.repeat_last_n, sp.repeat_penalty,
+                    sp.frequency_penalty, sp.presence_penalty));
+        } else if ((sp.frequency_penalty != 0.0f || sp.presence_penalty != 0.0f) && sp.repeat_last_n != 0) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
+                    llama_vocab_n_tokens(vocab_), sp.repeat_last_n, 1.0f,
+                    sp.frequency_penalty, sp.presence_penalty));
+        }
+        if (sp.top_k > 0) llama_sampler_chain_add(smpl, llama_sampler_init_top_k(sp.top_k));
+        if (sp.top_p > 0.0f && sp.top_p < 1.0f) llama_sampler_chain_add(smpl, llama_sampler_init_top_p(sp.top_p, 1));
+        if (sp.min_p > 0.0f) llama_sampler_chain_add(smpl, llama_sampler_init_min_p(sp.min_p, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(sp.temperature));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(sp.seed));
+    }
+
+    // Text-level stop strings: needed when the end-of-turn marker is not an EOG token
+    // (e.g. the ChatML fallback on a model that does not know ChatML).
+    std::vector<std::string> stops;
+    if (use_chatml_fallback_) stops = {"<|im_end|>", "<|im_start|>"};
+
+    // ---- 5. Decode loop ----
+    // With context shift the reply may run past the end of the window (old tokens are discarded).
+    const int32_t max_new = sp.context_shift
+            ? std::max(1, sp.max_new_tokens)
+            : std::max(1, std::min(sp.max_new_tokens, n_ctx_ - (int32_t) kv_tokens_.size() - 1));
+    // `pending` only holds text that has not been emitted yet (an incomplete UTF-8 sequence or a
+    // possible stop-string prefix), so per-token work stays O(1) instead of growing with the reply.
+    std::string pending;
+    pending.reserve(64);
+    std::vector<char> piece(128);
+
+    auto emit = [&](size_t n) -> bool {
+        if (n == 0) return true;
+        const bool keep_going = on_piece ? on_piece(pending.data(), n) : true;
+        pending.erase(0, n);
+        return keep_going;
+    };
+
+    const auto t_gen = Clock::now();
+    st.stop = StopReason::MaxTokens;
+#ifdef IRIS_SPEC
+    if (spec_ && spec_sync_) {
+        try { common_speculative_begin(spec_, 0, kv_tokens_); } catch (...) { spec_disable("begin failed"); }
+    }
+#endif
+    // 2.5.0-beta9 MTP: tokens produced by the last verification step. The first `queue_kv` are
+    // accepted drafts already in the KV cache; the one after them was sampled from the target and
+    // still has to be decoded (it plays the role of the usual per-token sample).
+    std::vector<llama_token> queue;
+    size_t queue_pos = 0, queue_kv = 0;
+    for (int32_t i = 0; i < max_new; ++i) {
+        if (cancelled_.load(std::memory_order_acquire)) { st.stop = StopReason::Cancelled; break; }
+
+        bool in_kv = false;
+        llama_token tok;
+        if (queue_pos < queue.size()) {
+            in_kv = queue_pos < queue_kv;
+            tok = queue[queue_pos++];
+        } else {
+            tok = llama_sampler_sample(smpl, ctx_, -1);
+        }
+        if (llama_vocab_is_eog(vocab_, tok)) { st.stop = StopReason::EndOfGeneration; break; }
+        st.generated_tokens++;
+
+        int32_t n = llama_token_to_piece(vocab_, tok, piece.data(), (int32_t) piece.size(), 0, false);
+        if (n < 0) {
+            piece.resize((size_t) -n);
+            n = llama_token_to_piece(vocab_, tok, piece.data(), (int32_t) piece.size(), 0, false);
+        }
+        if (n > 0) pending.append(piece.data(), (size_t) n);
+
+        // Stop strings: emitted text never ends in a stop prefix (held back below), so a match
+        // can only start inside `pending`.
+        if (!stops.empty()) {
+            const size_t cut = find_first_stop(pending, 0, stops);
+            if (cut != std::string::npos) {
+                pending.resize(cut);
+                st.stop = StopReason::EndOfGeneration;
+                break;
+            }
+        }
+
+        size_t safe = utf8_complete_prefix(pending);
+        if (!stops.empty()) safe -= stop_holdback(std::string_view(pending).substr(0, safe), stops);
+        if (!emit(safe)) { st.stop = StopReason::Cancelled; break; }
+        if (in_kv) continue;  // accepted draft: decoded during verification
+
+        if ((int32_t) kv_tokens_.size() >= n_ctx_ - 1) {
+            if (!sp.context_shift || !shift_context(sp.n_keep, st)) { st.stop = StopReason::ContextFull; break; }
+        }
+        apply_pending_threads();
+        if (apply_pending_policy(i + 1)) st.live_switches++;
+#ifdef IRIS_SPEC
+        if (spec_ && spec_sync_) {
+            // ---- MTP step: draft → decode [tok, drafts…] on the target → keep the agreeing prefix ----
+            const int32_t n_past = (int32_t) kv_tokens_.size();
+            int32_t n_max = std::min({spec_n_, n_ctx_ - n_past - 2, max_new - (i + 1) - 1});
+            n_max = std::max(n_max, 0);
+            llama_tokens draft;
+            if (n_max > 0) {
+                auto &dp = common_speculative_get_draft_params(spec_, 0);
+                dp.drafting = true;
+                dp.n_max = n_max;
+                dp.pos0 = n_past;
+                dp.id_last = tok;
+                dp.prompt = &kv_tokens_;
+                dp.result = &draft;
+                dp.result_q = nullptr;
+                bool drafted = true;
+                try { common_speculative_draft(spec_); } catch (...) { drafted = false; }
+                if (!drafted) {
+                    // 2.5.0-beta10: drafting failed → this token goes through normal decoding below.
+                    spec_disable("draft failed");
+                    draft.clear();
+                } else {
+                    if ((int32_t) draft.size() > n_max) draft.resize((size_t) n_max);
+                    spec_mem_rm(n_past);  // the head's own draft positions; verification re-feeds them
+                }
+            }
+          if (spec_) {
+            std::vector<int32_t> vb;
+            vb.reserve(draft.size() + 1);
+            vb.push_back(tok);
+            vb.insert(vb.end(), draft.begin(), draft.end());
+            common_batch b(ctx_);
+            for (size_t k = 0; k < vb.size(); ++k) b.add(vb[k], n_past + (llama_pos) k, 0, true);
+            const int32_t rc = llama_process(ctx_, LLAMA_PROCESS_TYPE_DECODE, b.get());
+            if (rc != 0) {
+                if (rc == 2 || cancelled_.load()) {
+                    st.stop = StopReason::Cancelled;
+                    resync_after_failure();
+                    break;
+                }
+                // 2.5.0-beta10: verification failed (e.g. the GPU backend) → drop MTP, restore the
+                // target memory to kv_tokens_ and decode `tok` alone through the normal path below.
+                spec_disable("verify decode failed (" + std::to_string(rc) + ")");
+                std::vector<int32_t> keep = kv_tokens_;
+                resync_after_failure();
+                if (kv_tokens_.size() != keep.size()) {
+                    llama_memory_clear(llama_get_memory(ctx_), true);
+                    kv_tokens_.clear();
+                    if (!decode_tokens(keep, 0, st)) break;
+                }
+                queue.clear();
+                queue_pos = queue_kv = 0;
+                goto normal_decode;
+            }
+            {
+                bool processed = false;
+                try { processed = common_speculative_process(spec_, b); } catch (...) { processed = false; }
+                if (!processed) spec_disable("verify process failed");  // target logits stay valid
+            }
+            queue.clear();
+            queue_pos = 0;
+            for (size_t j = 0; j <= draft.size(); ++j) {
+                const llama_token t = llama_sampler_sample(smpl, ctx_, (int32_t) j);
+                queue.push_back(t);
+                if (j == draft.size()) break;
+                if (t != draft[j] || (llama_vocab_is_eog(vocab_, t) && j + 1 < draft.size())) break;
+            }
+            queue_kv = queue.size() - 1;
+            if (spec_) common_speculative_accept(spec_, 0, (uint16_t) queue_kv);
+            st.drafted_tokens += (int32_t) draft.size();
+            st.accepted_tokens += (int32_t) queue_kv;
+            kv_tokens_.push_back(tok);
+            kv_tokens_.insert(kv_tokens_.end(), queue.begin(), queue.begin() + (long) queue_kv);
+            llama_memory_t mem = llama_get_memory(ctx_);
+            if (!llama_memory_seq_rm(mem, 0, (llama_pos) kv_tokens_.size(), -1)) {
+                // Should not happen (checked at load): rebuild the cache from the token list.
+                resource_log("MTP rollback failed: re-prefill %zu tokens, normal decoding", kv_tokens_.size());
+                std::vector<int32_t> keep = kv_tokens_;
+                spec_disable("rollback failed");
+                llama_memory_clear(mem, true);
+                kv_tokens_.clear();
+                if (!decode_tokens(keep, 0, st)) break;
+            } else {
+                spec_mem_rm((int32_t) kv_tokens_.size());
+            }
+            continue;
+          }
+        }
+        normal_decode:
+#endif
+        llama_batch batch = llama_batch_get_one(&tok, 1);
+        const int32_t rc = llama_decode(ctx_, batch);
+        if (rc != 0) {
+            if (rc == 2 || cancelled_.load()) st.stop = StopReason::Cancelled;
+            else { st.stop = StopReason::Error; st.error = "llama_decode 失败 (" + std::to_string(rc) + ")"; }
+            resync_after_failure();
+            break;
+        }
+        kv_tokens_.push_back(tok);
+    }
+    // Flush whatever is left (drop a dangling, incomplete UTF-8 sequence).
+    emit(utf8_complete_prefix(pending));
+    st.generate_us = us_since(t_gen);
+    st.kv_used = (int32_t) kv_tokens_.size();
+    if (st.drafted_tokens > 0) {
+        resource_log("MTP reply: drafted=%d accepted=%d (%.1f%%) tokens=%d in %.2fs",
+                     st.drafted_tokens, st.accepted_tokens, 100.0 * st.accepted_tokens / st.drafted_tokens,
+                     st.generated_tokens, st.generate_us / 1e6);
+    }
+
+    llama_sampler_free(smpl);
+    return st;
+}
+
+}  // namespace iris

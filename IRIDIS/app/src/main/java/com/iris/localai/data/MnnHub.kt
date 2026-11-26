@@ -1,0 +1,399 @@
+package com.iris.localai.data
+
+import com.iris.localai.I18n
+import com.iris.localai.R
+import com.iris.localai.engine.edge0.Edge0Assets
+import com.iris.localai.engine.edge0.Edge0Support
+import com.iris.localai.util.HintLog
+import com.iris.localai.util.io.ParallelDownload
+import android.os.StatFs
+import com.iris.localai.util.io.HttpDownload
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import java.io.File
+import java.io.IOException
+import java.net.HttpURLConnection
+import kotlin.coroutines.coroutineContext
+
+/**
+ * Downloads a whole MNN model repository (e.g. taobao-mnn/Qwen3-1.7B-MNN) from Hugging Face or its
+ * mirror into `models/<repo name>/`. Files land in `<repo name>.part/` (each one resumable) and the
+ * folder is renamed only after every file has its exact size, so a half download is never listed.
+ */
+class MnnHub(private val repo: ModelRepository) {
+
+    data class State(
+        val repoId: String = "",
+        val doneBytes: Long = 0,
+        val totalBytes: Long = 0,
+        val file: String = "",
+        val active: Boolean = false,
+        val error: String? = null,
+        /** source in use (「魔搭 ModelScope」…) and the last switch notice. */
+        val source: String = "",
+        val notice: String? = null,
+        /** C: stopped by 「暂停」; the .part files stay and 「继续」 resumes them. */
+        val paused: Boolean = false,
+    ) {
+        val progress: Float get() = if (totalBytes > 0) (doneBytes.toDouble() / totalBytes).toFloat().coerceIn(0f, 1f) else 0f
+    }
+
+    private val _state = MutableStateFlow(State())
+    val state: StateFlow<State> = _state.asStateFlow()
+
+    @Serializable
+    private data class TreeEntry(val type: String = "", val path: String = "", val size: Long = 0)
+
+    private val json = Json { ignoreUnknownKeys = true }
+
+    @Serializable private data class MsFiles(val Data: MsData? = null)
+    @Serializable private data class MsData(val Files: List<MsFile> = emptyList())
+    @Serializable private data class MsFile(val Path: String = "", val Size: Long = 0, val Type: String = "")
+
+    /** Sources for this download, best first (set after listing); the first one is demoted by 换源重试. */
+    @Volatile private var sources: List<DownloadSource> = emptyList()
+    @Volatile private var lastRequest: Pair<String, DownloadSource>? = null
+
+
+    /** r4 下载卡顿：每块都发进度会让下载页整页重组；最多每 250ms 发一次。 */
+    @Volatile private var lastTick = 0L
+    private fun tick(): Boolean {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastTick < 250) return false
+        lastTick = now; return true
+    }
+
+    suspend fun download(input: String, source: DownloadSource, demote: DownloadSource? = null, file: String? = null): LocalModel = withContext(Dispatchers.IO) {
+        val repoId = MnnModels.parseRepoId(input) ?: throw IOException(I18n.s(R.string.data_81c8d3))
+        val name = ModelFiles.sanitizeFileName(repoId.substringAfter('/'))
+        val modelsDir = repo.modelsDir // resolved once: shared Download/IRIDIS/models when available
+        val target = File(modelsDir, name)
+        if (target.exists() || repo.find(name) != null) throw IOException(I18n.s(R.string.data_f95dbe, name))
+        val partName = name + ModelRepository.PART_SUFFIX
+        if (!repo.claimPart(partName)) throw IOException(I18n.s(R.string.data_b3ea5f, repoId))
+        repo.unholdParts(); curParts = listOf(partName); curDir = modelsDir
+        _state.value = State(repoId = repoId, active = true, file = I18n.s(R.string.data_864643))
+        try {
+            // list the repo on every candidate source (自动: in parallel, the listing doubles as the
+            // speed probe); files then come from the ranked sources, each falling through to the next.
+            val (order, all) = listAll(repoId, source, demote)
+            sources = order
+            // one named file (a chip-specific NPU build) instead of the repo's generic one.
+            if (file != null) {
+                val hit = all.firstOrNull { it.type == "file" && it.path == file } ?: throw IOException(I18n.s(R.string.mtk244_file_missing, file, repoId))
+                repo.releasePart(partName)
+                return@withContext downloadSingle(order, repoId, hit.path, hit.size)
+            }
+            // an Edge0 asset repo — the whole folder (each file chunked + sha256), only on i8mm phones.
+            val edge0 = Edge0Assets.isFileSet(all.filter { it.type == "file" && '/' !in it.path }.map { it.path }.toSet())
+            if (edge0 && !Edge0Support.deviceOk()) throw IOException(I18n.s(R.string.e265_unsupported))
+            // a LiteRT-LM repo (litert-community/…) — download its one generic .litertlm file.
+            if (!edge0) pickLiteRtFile(all.filter { it.type == "file" }.map { it.path to it.size })?.let { (path, size) ->
+                repo.releasePart(partName)
+                return@withContext downloadSingle(order, repoId, path, size)
+            }
+            // a GGUF repo (no MNN set) — download its one Q4 .gguf file.
+            if (!edge0 && !MnnModels.isModelFileSet(all.filter { it.type == "file" && '/' !in it.path }.map { it.path }.toSet())) {
+                pickGgufFile(all.filter { it.type == "file" }.map { it.path to it.size })?.let { (path, size) ->
+                    repo.releasePart(partName)
+                    return@withContext downloadSingle(order, repoId, path, size)
+                }
+            }
+            val files = all.filter { it.type == "file" && MnnModels.shouldCopy(it.path) }
+            if (!edge0 && !MnnModels.isModelFileSet(files.filter { '/' !in it.path }.map { it.path }.toSet())) {
+                throw IOException(I18n.s(R.string.data_5f9c4b, repoId))
+            }
+            val total = files.sumOf { it.size }
+            val part = File(modelsDir, partName).apply { mkdirs() }
+            val have = files.sumOf { f -> File(part, f.path).takeIf { it.exists() }?.length()?.coerceAtMost(f.size) ?: 0L }
+            val free = StatFs(modelsDir.absolutePath).availableBytes
+            if (free < total - have + 256L * 1024 * 1024) {
+                throw IOException(I18n.s(R.string.data_9c1de2, Format.bytes(total - have), Format.bytes(free)))
+            }
+            var done = have
+            _state.value = _state.value.copy(totalBytes = total, doneBytes = done)
+            for (f in files) {
+                coroutineContext.ensureActive()
+                val out = File(part, f.path).apply { parentFile?.mkdirs() }
+                if (out.exists() && out.length() == f.size) continue
+                val before = done - (HttpDownload.partFile(out).takeIf { it.exists() }?.length() ?: 0L)
+                _state.value = _state.value.copy(file = f.path)
+                fetch(urlsFor(repoId, f.path, order), out, f.size) { got -> done = before + got; if (tick()) _state.value = _state.value.copy(doneBytes = done) }
+                done = before + f.size
+            }
+            if (!part.renameTo(target)) throw IOException(I18n.s(R.string.data_04dd9d))
+            lastDone = repoId; _state.value = State()
+        } catch (t: Throwable) {
+            _state.value = stopped(repoId, t)
+            throw t
+        } finally {
+            repo.releasePart(partName)
+        }
+        repo.refresh()
+        LocalModel(target.name, target.absolutePath, MnnModels.folderSize(target),
+            if (Edge0Assets.isAssetDir(target)) ModelFormat.EDGE0 else ModelFormat.MNN)
+    }
+
+    /** One .litertlm file into models/ (resumable through its .part), listed only when complete. */
+    private suspend fun downloadSingle(order: List<DownloadSource>, repoId: String, path: String, size: Long): LocalModel {
+        val fileName = ModelFiles.sanitizeFileName(path.substringAfterLast('/'))
+        val modelsDir = repo.modelsDir
+        val target = File(modelsDir, fileName)
+        if (target.exists() || repo.find(fileName) != null) throw IOException(I18n.s(R.string.data_f95dbe, fileName))
+        val partName = fileName + ModelRepository.PART_SUFFIX
+        if (!repo.claimPart(partName)) throw IOException(I18n.s(R.string.data_b3ea5f, repoId))
+        curParts = listOf(partName); curDir = modelsDir
+        try {
+            val have = HttpDownload.partFile(target).takeIf { it.exists() }?.length() ?: 0L
+            val free = StatFs(modelsDir.absolutePath).availableBytes
+            if (free < size - have + 256L * 1024 * 1024) throw IOException(I18n.s(R.string.data_9c1de2, Format.bytes(size - have), Format.bytes(free)))
+            _state.value = _state.value.copy(totalBytes = size, doneBytes = have, file = fileName)
+            // fetchOnce writes target.part and renames it when complete, so a half file is never listed.
+            fetch(urlsFor(repoId, path, order), target, size) { got -> if (tick()) _state.value = _state.value.copy(doneBytes = got) }
+            lastDone = repoId; _state.value = State()
+        } finally {
+            repo.releasePart(partName)
+        }
+        repo.refresh()
+        val format = if (fileName.endsWith(".gguf", ignoreCase = true)) ModelFormat.GGUF else ModelFormat.LITERT
+        return LocalModel(target.name, target.absolutePath, target.length(), format)
+    }
+
+    private fun urlsFor(repoId: String, path: String, order: List<DownloadSource>): List<SourceUrl> =
+        DownloadSources.candidates("${DownloadSources.HF}/$repoId/resolve/main/${encodePath(path)}", order)
+
+    /**
+     * File list of [repoId] plus the source order to download from. 自动: every source listed in parallel
+     * (~6 s each), ranked by response time ([DownloadSources.rank]); a manual choice is tried first.
+     */
+    private suspend fun listAll(repoId: String, chosen: DownloadSource, demote: DownloadSource?): Pair<List<DownloadSource>, List<TreeEntry>> {
+        val ms = DownloadSources.modelScopeFor(repoId)
+        val order = DownloadSources.order(chosen, ms != null, DownloadSources.lastGood, demote)
+        val results = kotlinx.coroutines.coroutineScope {
+            order.map { src ->
+                async(Dispatchers.IO) {
+                    val t0 = System.nanoTime()
+                    val r = try { Result.success(listOn(src, repoId, ms)) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { Result.failure(e) }
+                    Triple(src, (System.nanoTime() - t0) / 1_000_000, r)
+                }
+            }.awaitAll()
+        }
+        val lat = results.associate { (s, ms0, r) -> s to (if (r.isSuccess && r.getOrThrow().isNotEmpty()) ms0 else null) }
+        val ranked = if (chosen == DownloadSource.AUTO && demote == null) DownloadSources.rank(order, lat) else order
+        // 列目录本身就是测速——记下来，后面同仓库的文件不再另测；详情里显示「测速 …」
+        lat.forEach { (s, m) -> DownloadSources.remember(s, repoId, m) }
+        DownloadSources.log(DownloadSources.SPEED, "$repoId " + DownloadSources.speedLine(order, lat))
+        if (order.size > 1) _state.value = _state.value.copy(notice = DownloadSources.speedLine(order, lat))
+        val first = ranked.firstNotNullOfOrNull { s -> results.first { it.first == s }.third.getOrNull()?.takeIf { it.isNotEmpty() } }
+            ?: throw IOException(I18n.s(R.string.data_d66ab7, repoId) + results.joinToString("\n") { (s, _, r) ->
+                I18n.s(R.string.data_a4f150, s.label) + (r.exceptionOrNull()?.let { DownloadSources.describe(it) } ?: I18n.s(R.string.data_e67a89))
+            })
+        return ranked to first
+    }
+
+    private fun listOn(src: DownloadSource, repoId: String, ms: DownloadSources.MsRepo?): List<TreeEntry> = when (src) {
+        DownloadSource.MODELSCOPE -> if (ms == null) emptyList() else listModelScope(ms)
+        else -> listFiles(src.baseUrl, repoId)
+    }
+
+    private fun listModelScope(ms: DownloadSources.MsRepo): List<TreeEntry> {
+        val conn = HttpDownload.open("${DownloadSources.MS}/api/v1/models/${ms.id}/repo/files?Recursive=true", 0, timeoutMs = 6_000)
+        try {
+            val code = conn.responseCode
+            if (code != HttpURLConnection.HTTP_OK) throw IOException("HTTP $code")
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            return modelScopeTree(json.decodeFromString<MsFiles>(body).Data?.Files.orEmpty().map { Triple(it.Path, it.Size, it.Type) }, ms.prefix)
+                .map { (p, sz) -> TreeEntry("file", p, sz) }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun listFiles(base: String, repoId: String): List<TreeEntry> {
+        val conn = HttpDownload.open("$base/api/models/$repoId/tree/main?recursive=true", 0, timeoutMs = 6_000)
+        try {
+            val code = conn.responseCode
+            if (code == HttpURLConnection.HTTP_NOT_FOUND || code == 401) throw IOException(I18n.s(R.string.data_a69177, repoId))
+            if (code != HttpURLConnection.HTTP_OK) throw IOException("HTTP $code")
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            return json.decodeFromString<List<TreeEntry>>(body)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private suspend fun fetch(cands: List<SourceUrl>, target: File, expected: Long, onBytes: (Long) -> Unit) {
+        DownloadSources.fetchAny(
+            cands, target, expected, onBytes,
+            fetch = { u, t, e, b -> ParallelDownload.fetch(u, t, e, b) }, // 多线程分块 + sha256
+            onSource = { c -> _state.value = _state.value.copy(source = c.label) },
+            onSwitch = { msg -> _state.value = _state.value.copy(notice = msg) },
+        )
+    }
+
+    @Volatile private var job: kotlinx.coroutines.Job? = null
+
+    /** Runs in the app scope so the download survives leaving the models screen. */
+    fun start(scope: kotlinx.coroutines.CoroutineScope, input: String, source: DownloadSource, demote: DownloadSource? = null, file: String? = null, onDone: suspend (LocalModel) -> Unit) {
+        if (job?.isActive == true) return
+        lastRequest = input to source
+        retry = { d -> start(scope, input, source, d, file, onDone) }
+        job = scope.launch {
+            try { onDone(download(input, source, demote, file)) } catch (_: Throwable) { /* reported through state */ }
+        }
+    }
+
+    /** 「换源重试」: the failed download again, its first source moved to the end (resumes the .part files). */
+    fun retryOtherSource(@Suppress("UNUSED_PARAMETER") scope: kotlinx.coroutines.CoroutineScope, @Suppress("UNUSED_PARAMETER") onDone: suspend (LocalModel) -> Unit) {
+        val failed = DownloadSource.CONCRETE.firstOrNull { it.label == _state.value.source } ?: sources.firstOrNull()
+        retry?.invoke(failed ?: DownloadSource.HF_MIRROR)
+    }
+
+    @Volatile private var retry: ((DownloadSource?) -> Unit)? = null
+
+    /**
+     * 「在线搜索模型」: one GGUF (all parts of a split one) plus an optional vision projector, from a
+     * search hit, into models/ — same resumable, source-switching fetch; listed once every file is complete.
+     * [files] = (remote path, size, local name); the first one is the model.
+     */
+    fun startGguf(
+        scope: kotlinx.coroutines.CoroutineScope, hit: GgufSearch.RepoHit, files: List<Triple<String, Long, String>>,
+        source: DownloadSource, demote: DownloadSource? = null, onDone: suspend (LocalModel) -> Unit,
+    ) {
+        if (job?.isActive == true) return
+        retry = { d -> startGguf(scope, hit, files, source, d, onDone) }
+        job = scope.launch {
+            try { onDone(downloadGguf(hit, files, source, demote)) } catch (_: Throwable) { /* reported through state */ }
+        }
+    }
+
+    private suspend fun downloadGguf(hit: GgufSearch.RepoHit, files: List<Triple<String, Long, String>>, source: DownloadSource, demote: DownloadSource?): LocalModel = withContext(Dispatchers.IO) {
+        if (hit.gated) throw IOException(GATED)
+        val mainName = files.first().third
+        // every GGUF download (main + shards + mmproj) goes into models/<name>/
+        val modelsDir = File(repo.modelsDir, GgufFolder.folderFor(mainName)).apply { mkdirs() }
+        if (File(modelsDir, mainName).exists() || repo.find(mainName) != null) throw IOException(I18n.s(R.string.data_f95dbe, mainName))
+        val claimed = files.map { it.third + ModelRepository.PART_SUFFIX }
+        if (!claimed.all { repo.claimPart(it) }) { claimed.forEach { repo.releasePart(it) }; throw IOException(I18n.s(R.string.data_b3ea5f, hit.id)) }
+        repo.unholdParts(); curParts = claimed; curDir = modelsDir
+        val total = files.sumOf { it.second }
+        _state.value = State(repoId = hit.id, active = true, totalBytes = total, file = mainName)
+        try {
+            val have = files.sumOf { (_, size, name) ->
+                val t = File(modelsDir, name)
+                if (t.exists() && t.length() == size) size else HttpDownload.partFile(t).takeIf { it.exists() }?.length()?.coerceAtMost(size) ?: 0L
+            }
+            val free = StatFs(modelsDir.absolutePath).availableBytes
+            if (free < total - have + 256L * 1024 * 1024) throw IOException(I18n.s(R.string.data_9c1de2, Format.bytes(total - have), Format.bytes(free)))
+            var done = have
+            _state.value = _state.value.copy(doneBytes = done)
+            // the model's parts and the projector are written with .part first; the main file goes last so the
+            // model is only listed once everything it needs is on disk
+            for ((path, size, name) in files.drop(1) + files.first()) {
+                coroutineContext.ensureActive()
+                val out = File(modelsDir, name)
+                if (out.exists() && out.length() == size) continue
+                val before = done - (HttpDownload.partFile(out).takeIf { it.exists() }?.length() ?: 0L)
+                _state.value = _state.value.copy(file = name)
+                try {
+                    val cands = GgufSearch.urls(hit, path, source, demote)
+                    DownloadSources.lastSpeed?.takeIf { source == DownloadSource.AUTO && demote == null }?.let { _state.value = _state.value.copy(notice = it) }
+                    fetch(cands, out, size) { got -> done = before + got; if (tick()) _state.value = _state.value.copy(doneBytes = done) }
+                } catch (e: DownloadSources.NotFound) {
+                    throw IOException(GATED)
+                }
+                done = before + size
+            }
+            lastDone = hit.id; _state.value = State()
+        } catch (t: Throwable) {
+            _state.value = stopped(hit.id, t)
+            throw t
+        } finally {
+            claimed.forEach { repo.releasePart(it) }
+        }
+        repo.refresh()
+        val main = File(modelsDir, mainName)
+        LocalModel(main.name, main.absolutePath, files.filterNot { isProjectorFile(it.third) }.sumOf { it.second }, ModelFormat.GGUF)
+    }
+
+
+    /** User 「取消」: stop and clear the card (the .part files stay, a later download of the same model resumes). */
+    fun cancel() { pausing = false; job?.cancel(); if (_state.value.paused) { repo.unholdParts(); _state.value = State() } }
+
+    /**
+     * 「清除」 on a paused download: deletes what it already wrote (.part files, segments, an
+     * emptied model folder) and clears the card. Returns the bytes freed (0 when nothing was paused).
+     */
+    fun discard(): Long {
+        if (!_state.value.paused || job?.isActive == true) return 0L
+        val dir = curDir
+        val freed = if (dir != null) runCatching { PartCleanup.discard(dir, curParts, keepDir = repo.modelsDir) }.getOrDefault(0L) else 0L
+        repo.unholdParts(); curParts = emptyList(); curDir = null
+        _state.value = State()
+        return freed
+    }
+
+    /** C 「暂停」: stop, keep the progress; [resume] continues from the .part files on the same sources. */
+    fun pause() { if (job?.isActive == true) { pausing = true; job?.cancel() } }
+    fun resume() { if (job?.isActive != true) retry?.invoke(null) }
+
+    @Volatile private var pausing = false
+    /** repo of the last download that finished (for the 「下载完成」 notification). */
+    @Volatile var lastDone: String? = null; private set
+
+    /** `.part` names of the current download; held in [ModelRepository] while paused so cleanup keeps them. */
+    @Volatile private var curParts: List<String> = emptyList()
+    /** the folder [curParts] live in (models/ or models/<name>/ for GGUF). */
+    @Volatile private var curDir: File? = null
+
+    /** State after a download ended with [t]: paused, cancelled (cleared) or failed. */
+    private fun stopped(repoId: String, t: Throwable): State {
+        val cur = _state.value
+        return if (t is kotlinx.coroutines.CancellationException) {
+            if (pausing) { pausing = false; repo.holdParts(curParts); State(repoId = repoId, doneBytes = cur.doneBytes, totalBytes = cur.totalBytes, source = cur.source, paused = true) } else State()
+        } else State(repoId = repoId, error = t.message ?: I18n.s(R.string.data_65e200), source = cur.source)
+            .also { HintLog.add(repoId + I18n.s(R.string.data_b25c4c) + it.error, HintLog.Source.DOWNLOAD) }
+    }
+
+    fun clearError() { if (!_state.value.active) { if (_state.value.paused) repo.unholdParts(); _state.value = State() } }
+
+    companion object {
+        val GATED: String get() = I18n.s(R.string.data_6a6291)
+
+        /** the Q4 .gguf of a GGUF repo (Q4_K_M, else Q4_0, else any Q4); no mmproj. Pure. */
+        fun pickGgufFile(files: List<Pair<String, Long>>): Pair<String, Long>? {
+            val g = files.filter { it.first.endsWith(".gguf", ignoreCase = true) && '/' !in it.first && !it.first.contains("mmproj", ignoreCase = true) }
+            return g.firstOrNull { it.first.contains("Q4_K_M", true) } ?: g.firstOrNull { it.first.contains("Q4_0", true) }
+                ?: g.firstOrNull { it.first.contains("Q4", true) }
+        }
+
+        /**
+         * The generic .litertlm of a LiteRT-LM repo: not -web/-gpu/.task, not a chip-specific build
+         * (`_qualcomm_…`, `_Google_Tensor_…`); null when the repo has none. Pure.
+         */
+        fun pickLiteRtFile(files: List<Pair<String, Long>>): Pair<String, Long>? {
+            val lm = files.filter { it.first.endsWith(".litertlm", ignoreCase = true) && '/' !in it.first }
+            if (lm.isEmpty()) return null
+            val generic = lm.filter { (p, _) -> val stem = p.removeSuffix(".litertlm"); !stem.contains('_') && !Regex("(?i)-(web|gpu)$").containsMatchIn(stem) }
+            return (generic.ifEmpty { lm }).minByOrNull { it.first.length }
+        }
+
+        /** ModelScope repo/files → (path without [prefix], size) of the files under [prefix]. Pure. */
+        fun modelScopeTree(files: List<Triple<String, Long, String>>, prefix: String): List<Pair<String, Long>> =
+            files.filter { it.third == "blob" && it.first.startsWith(prefix) }.map { it.first.removePrefix(prefix) to it.second }
+
+        fun encodePath(path: String): String = path.split('/').joinToString("/") { seg ->
+            java.net.URLEncoder.encode(seg, "UTF-8").replace("+", "%20")
+        }
+    }
+}

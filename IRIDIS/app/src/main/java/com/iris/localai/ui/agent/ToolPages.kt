@@ -1,0 +1,122 @@
+package com.iris.localai.ui.agent
+
+import com.iris.localai.I18n
+import com.iris.localai.R
+import com.iris.localai.agent.web.BrowserText
+import com.iris.localai.ui.components.IrisProgressBar
+import android.content.Intent
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.material.icons.outlined.DeleteSweep
+import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.iris.localai.IrisApp
+import com.iris.localai.ui.components.Divider
+import com.iris.localai.ui.components.GroupFootnote
+import com.iris.localai.ui.components.IrisButton
+import com.iris.localai.ui.components.IrisButtonStyle
+import com.iris.localai.ui.components.PressableIcon
+import com.iris.localai.ui.components.SegmentedControl
+import com.iris.localai.ui.components.SettingsGroup
+import com.iris.localai.ui.components.SettingsRow
+import com.iris.localai.ui.components.SubpageScaffold
+import com.iris.localai.ui.components.irisTextFieldColors
+import com.iris.localai.ui.theme.Iris
+import com.iris.localai.ui.theme.IrisDimens
+import com.iris.localai.ui.theme.IrisRadius
+import com.iris.localai.ui.theme.IrisType
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/** texts of the 浏览器 pages (unit-tested). */
+object ToolPageText {
+    val BROWSER_NAV: String get() = I18n.s(R.string.agent_edb1e1)
+    val BROWSER_NOTE: String get() = I18n.s(R.string.agent_fc83b5)
+}
+
+@Composable
+fun BrowserPage(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val agent = remember { (context.applicationContext as IrisApp).container.agent }
+    val browser = agent.browser
+    val st by browser.status.collectAsStateWithLifecycle()
+    var url by remember { mutableStateOf(st.url) }
+    LaunchedEffect(st.url) { url = st.url }
+    val c = Iris.colors
+    val web = remember { browser.webView() }
+    DisposableEffect(Unit) {
+        onDispose {
+            (web.parent as? android.view.ViewGroup)?.removeView(web)
+            browser.layoutOffscreen(web)
+        }
+    }
+    SubpageScaffold(I18n.s(R.string.agent_912302), onBack, scrollUnder = false, actions = {
+        PressableIcon(Icons.AutoMirrored.Outlined.ArrowBack, I18n.s(R.string.agent_5094c1), enabled = web.canGoBack()) { web.goBack() }
+        PressableIcon(Icons.Outlined.Refresh, I18n.s(R.string.models_694fc5)) { web.reload() }
+    }) {
+        Column(Modifier.fillMaxSize().navigationBarsPadding()) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = IrisDimens.space12, vertical = IrisDimens.space6), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    url, { url = it },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    textStyle = IrisType.secondary.copy(color = c.text),
+                    placeholder = { Text(I18n.s(R.string.agent_efd030), style = IrisType.secondary) },
+                    shape = IrisRadius.mediumShape,
+                    colors = irisTextFieldColors(),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go, autoCorrectEnabled = false),
+                    keyboardActions = KeyboardActions(onGo = { web.loadUrl(BrowserText.normalizeUrl(url)) }),
+                )
+            }
+            if (st.loading) IrisProgressBar(progress = null, height = IrisDimens.space2, track = c.outline.copy(alpha = 0.4f))
+            Box(Modifier.weight(1f).fillMaxWidth().clip(IrisRadius.mediumShape).background(c.surface)) {
+                AndroidView(factory = {
+                    (web.parent as? android.view.ViewGroup)?.removeView(web)
+                    web
+                }, modifier = Modifier.fillMaxSize())
+            }
+            GroupFootnote(ToolPageText.BROWSER_NOTE, modifier = Modifier.padding(bottom = IrisDimens.space8))
+        }
+    }
+}

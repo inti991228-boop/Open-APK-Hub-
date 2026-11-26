@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Network: only for user-initiated model downloads and the opt-in local API server. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Voice input (hold-to-talk and voice mode). Requested at first use. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Local API server -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 3.0 振动重做（合成原语） -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 3.0 悬浮窗（同声传译用麦克风） -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 2.5.0: Android 16 Live Updates (promoted ongoing 「生成中」 notification). -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <!-- Held only for the duration of an API request, never while idle. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 2.1.9: optional, granted by the user over adb: switch the GUI 无障碍 service back on before a task (IrisAccessibilityService.selfEnable). -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" tools:ignore="ProtectedPermissions" />
+    <!-- 1.10.13: asks once to be left running in the background while a reply generates. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 1.12.0: phone tool (alarm / timer via the clock app). -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <!-- 2.5.0-beta7 phone tool: brightness (user grants on its settings page) and ringer mode under DND -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+    <queries>
+        <!-- 1.12.0: phone tool: find launchable apps and the apps that handle its intents. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent><action android:name="android.intent.action.SET_ALARM" /></intent>
+        <intent><action android:name="android.intent.action.SET_TIMER" /></intent>
+        <intent><action android:name="android.intent.action.DIAL" /></intent>
+        <intent>
+            <action android:name="android.intent.action.INSERT" />
+            <data android:mimeType="vnd.android.cursor.dir/event" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="text/plain" />
+        </intent>
+        <!-- 2.2.10: 朗读引擎「系统 TTS」 -->
+        <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
+    </queries>
+    <!-- 1.10.6: optional 「全部文件访问」 so 智能体 can read and edit files the user put in
+         Download/IRISLocalAI (scoped storage hides files created by other apps). Asked from 设置›智能体. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <application
+        android:name=".IrisApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:fullBackupContent="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:localeConfig="@xml/locales_config"
+        android:supportsRtl="true"
+        android:enableOnBackInvokedCallback="true"
+        android:theme="@style/Theme.Iris"
+        tools:targetApi="35">
+
+        <!-- Vendor OpenCL driver (Adreno). Optional: loaded with dlopen, CPU is used when absent. -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL_adreno.so" android:required="false" />
+        <!-- 2.2.15: FastRPC for the built-in llama.cpp Hexagon (NPU) runtime -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".util.RestartActivity"
+            android:exported="false"
+            android:process=":restart"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <service
+            android:name=".server.ApiService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local HTTP server exposing the on-device language model to other apps on this device or LAN, started and stopped explicitly by the user." />
+        </service>
+        <!-- Keeps a chat reply generating while the app is in the background; runs only for that reply. -->
+        <service
+            android:name=".service.GenerationService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="On-device language model is generating a reply the user requested; runs only until that reply finishes or the user taps Stop." />
+        </service>
+        <!-- 2.7.1: keeps a 生图 the user started going while the app is in the background; runs only for that image. -->
+        <service
+            android:name=".service.ImageGenJobService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="On-device image generation the user requested is running; runs only until that image finishes or the user taps Stop." />
+        </service>
+        <!-- 2.4.4: keeps IRIDIS alive while a model the user chose downloads; runs only during that download. -->
+        <!-- 2.4.6: 生图 runs in its own process; a native crash there leaves the app running. -->
+        <service
+            android:name=".imagegen.ImageGenService"
+            android:exported="false"
+            android:process=":imagegen" />
+        <service
+            android:name=".service.DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <!-- 1.10.3: keeps IRIS alive while a model compiles for the GPU / NPU (minutes); runs only during that load. -->
+        <service
+            android:name=".service.LoadKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="On-device language model the user selected is being compiled for the GPU; runs only until that load finishes so the half-built compile cache is not lost." />
+        </service>
+        <!-- 2.2 GUI 智能体（形态 A）: sees the screen (screenshot + node tree) and taps / swipes / types for a task the user started; off until the user enables it in 系统设置 › 无障碍. -->
+        <service
+            android:name=".agent.gui.android.IrisAccessibilityService"
+            android:exported="false"
+            android:label="@string/gui_a11y_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/iris_accessibility_service" />
+        </service>
+        <!-- 3.0 悬浮窗：AI 翻译、同声传译、识屏、漫画翻译、搜索；用户在 工具箱 里打开才运行。 -->
+        <service
+            android:name=".floating.FloatingService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Floating assistant bubble the user turned on (translate, live interpretation, screen reading); runs until the user closes it." />
+        </service>
+        <!-- 3.0 桌面小组件：快速开始新对话 / 语音 / 生图 / 工具箱。 -->
+        <receiver
+            android:name=".widget.QuickWidget"
+            android:exported="false"
+            android:label="@string/v30_widget_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/iris_quick_widget" />
+        </receiver>
+        <!-- 2.2: shares a chat image (a copy in cache/shared) and files of Download/IRIDIS picked on the 文件 page. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/shared_paths" />
+        </provider>
+    </application>
+</manifest>
