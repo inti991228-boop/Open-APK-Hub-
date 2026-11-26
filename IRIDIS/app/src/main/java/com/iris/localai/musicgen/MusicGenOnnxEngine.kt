@@ -1,6 +1,7 @@
 package com.iris.localai.musicgen
 
 import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
@@ -202,7 +203,10 @@ object MusicGenOnnxEngine {
                         require(shape.isEmpty() || shape.fold(1L) { total, dimension -> total * dimension } == 1L) {
                             "use_cache_branch must be a scalar boolean"
                         }
-                        inputs[name] = OnnxTensor.createTensor(environment, booleanArrayOf(useCache), shape)
+                        val value = ByteBuffer.allocateDirect(1)
+                            .put((if (useCache) 1 else 0).toByte())
+                            .apply { flip() }
+                        inputs[name] = OnnxTensor.createTensor(environment, value, shape, OnnxJavaType.BOOL)
                     }
                     name.startsWith("past_key_values") -> {
                         val value = cache[name] ?: if (!useCache) emptyCache(tensorInfo(session, name).shape) else

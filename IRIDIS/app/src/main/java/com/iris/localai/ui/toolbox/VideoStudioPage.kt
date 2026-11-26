@@ -3,10 +3,10 @@ package com.iris.localai.ui.toolbox
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.content.ContentResolver
-import android.media.MediaController
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.widget.MediaController
 import android.widget.VideoView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest

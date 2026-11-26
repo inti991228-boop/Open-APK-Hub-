@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.StatFs
 import android.provider.DocumentsContract
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.FileOutputStream
